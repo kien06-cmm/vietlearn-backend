@@ -2,10 +2,17 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const admin = require('firebase-admin');
+
+// --- FIREBASE ADMIN SDK v12+ (modular API) ---
+// firebase-admin v12 trở lên đã loại bỏ hoàn toàn cách viết
+// admin.initializeApp() / admin.credential.cert() / admin.firestore() kiểu
+// namespace cũ. Từ v12+, phải import từng submodule riêng như dưới đây.
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue, FieldPath } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 
 /**
- * --- FIREBASE ADMIN SDK — CẤU HÌNH BẰNG SERVICE ACCOUNT ---
+ * --- KHỞI TẠO FIREBASE ADMIN SDK — CẤU HÌNH BẰNG SERVICE ACCOUNT ---
  *
  * Cách lấy Service Account:
  * 1. Vào Firebase Console -> Project settings -> Service accounts.
@@ -22,21 +29,46 @@ const admin = require('firebase-admin');
  *    Variable của Render, các ký tự xuống dòng thật sẽ bị Render lưu thành
  *    chuỗi "\n" (2 ký tự gạch chéo ngược + n) chứ không phải xuống dòng
  *    thật -> cần .replace(/\\n/g, '\n') lúc đọc lại như dưới đây, nếu
- *    không admin.credential.cert() sẽ báo lỗi "Invalid PEM formatted
- *    message" khi khởi động server.
+ *    không cert() sẽ báo lỗi "Invalid PEM formatted message" khi khởi
+ *    động server.
+ *
+ * FIX (crash "Cannot read properties of undefined (reading 'cert')"):
+ * lỗi này xảy ra vì bản firebase-admin v12+ không còn export namespace
+ * "admin.credential" nữa (require('firebase-admin') vẫn chạy được nhưng
+ * admin.credential là undefined) — phải import cert() trực tiếp từ
+ * 'firebase-admin/app' như trên. Toàn bộ việc khởi tạo được bọc trong
+ * try...catch: nếu thiếu/sai biến môi trường, server sẽ log rõ nguyên
+ * nhân rồi dừng lại có kiểm soát (process.exit(1)) thay vì crash với
+ * TypeError mơ hồ giữa chừng khi có request đầu tiên gọi tới dbAdmin.
  *
  * KHÔNG dùng chung Service Account này ở phía frontend (login.js,
  * register.js...) — nó có toàn quyền Admin, chỉ được nằm trên server.
  */
-admin.initializeApp({
-    credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n')
-    })
-});
+let dbAdmin;
+let authAdmin;
 
-const dbAdmin = admin.firestore();
+try {
+    const firebaseApp = initializeApp({
+        credential: cert({
+            projectId: process.env.FIREBASE_PROJECT_ID,
+            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+            privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n')
+        })
+    });
+
+    dbAdmin = getFirestore(firebaseApp);
+    authAdmin = getAuth(firebaseApp);
+
+    console.log('✅ Firebase Admin SDK khởi tạo thành công.');
+} catch (err) {
+    // Log rõ nguyên nhân thật (thường là thiếu biến môi trường hoặc
+    // FIREBASE_PRIVATE_KEY bị dính \n sai định dạng) rồi dừng process có
+    // kiểm soát — tránh để server "sống dở chết dở", nhận request nhưng
+    // mọi API dùng Firestore/Auth đều crash ngẫu nhiên về sau.
+    console.error('❌ Lỗi khởi tạo Firebase Admin SDK:', err.message);
+    console.error('   Kiểm tra lại 3 biến môi trường trên Render: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY.');
+    process.exit(1);
+}
 
 const app = express();
 
@@ -67,7 +99,7 @@ async function verifyFirebaseToken(req, res, next) {
     }
 
     try {
-        const decoded = await admin.auth().verifyIdToken(idToken);
+        const decoded = await authAdmin.verifyIdToken(idToken);
         req.uid = decoded.uid;
         next();
     } catch (err) {
@@ -89,15 +121,76 @@ function getCorrectIndexServer(q) {
     return typeof q.correctAnswer === 'number' ? q.correctAnswer : -1;
 }
 
+/**
+ * Xác nhận học sinh (studentId) thực sự là thành viên active của lớp sở
+ * hữu 1 bài kiểm tra cụ thể — dùng chung cho cả /api/submit-exam và
+ * /api/get-exam-questions để tránh lặp code và đảm bảo 2 API áp cùng 1
+ * mức kiểm tra quyền truy cập.
+ *
+ * Trả về { ok: true, examData } nếu hợp lệ, hoặc { ok: false, status,
+ * message } nếu không — nơi gọi chỉ cần res.status(status).json({message}).
+ */
+async function loadExamForStudent(examId, studentId) {
+    const examSnap = await dbAdmin.collection('exams').doc(examId).get();
+    if (!examSnap.exists) {
+        return { ok: false, status: 404, message: 'Không tìm thấy bài kiểm tra.' };
+    }
+    const examData = examSnap.data();
+
+    if (examData.status !== 'active') {
+        return { ok: false, status: 403, message: 'Bài kiểm tra đã đóng hoặc chưa mở, không thể tiếp tục.' };
+    }
+
+    const memberSnap = await dbAdmin
+        .collection('class_members')
+        .doc(`${studentId}_${examData.class_id}`)
+        .get();
+    if (!memberSnap.exists || memberSnap.data().status !== 'active') {
+        return { ok: false, status: 403, message: 'Bạn không phải thành viên đang hoạt động của lớp học này.' };
+    }
+
+    return { ok: true, examData };
+}
+
+/**
+ * Lấy nội dung câu hỏi thật theo danh sách ID, chia chunk 10 vì toán tử
+ * Firestore "in" giới hạn tối đa 10 giá trị/lần truy vấn. Giữ đúng thứ tự
+ * questionIds ban đầu; bỏ qua câu hỏi đã bị xoá khỏi ngân hàng.
+ */
+async function fetchQuestionsByIds(questionIds) {
+    const chunks = [];
+    for (let i = 0; i < questionIds.length; i += 10) {
+        chunks.push(questionIds.slice(i, i + 10));
+    }
+
+    const chunkSnaps = await Promise.all(
+        chunks.map((chunk) =>
+            dbAdmin
+                .collection('questions')
+                .where(FieldPath.documentId(), 'in', chunk)
+                .get()
+        )
+    );
+
+    const questionMap = {};
+    chunkSnaps.forEach((snap) => {
+        snap.docs.forEach((d) => {
+            questionMap[d.id] = { id: d.id, ...d.data() };
+        });
+    });
+
+    return questionIds.map((id) => questionMap[id]).filter(Boolean);
+}
+
 // --- API Xử lý Bóc tách tài liệu (PDF/Word/Forms) ---
 app.post('/api/extract-questions', async (req, res) => {
     try {
         const { source, mimeType, fileBase64, formsUrl } = req.body;
         console.log("Đã nhận yêu cầu xử lý từ frontend:", source);
-        
+
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
         // Sử dụng model Gemini 3.5 Flash Lite siêu tốc
-        const model = genAI.getGenerativeModel({ 
+        const model = genAI.getGenerativeModel({
             model: "gemini-3.5-flash-lite",
             systemInstruction: `Bạn là trợ lý AI chuyên phân tích tài liệu giáo dục. Nhiệm vụ của bạn là bóc tách các câu hỏi trong tài liệu và trả về MỘT MẢNG JSON duy nhất chứa các câu hỏi theo đúng định dạng sau:
 [
@@ -138,7 +231,7 @@ TUYỆT ĐỐI CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG KÝ HIỆU MARK
 
         const result = await model.generateContent(requestContent);
         let text = result.response.text().replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
-        
+
         // Trả về đúng định dạng { questions: [...] } mà Frontend yêu cầu
         res.json({ questions: JSON.parse(text) });
 
@@ -191,26 +284,13 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         }
         const safeAnswers = (answers && typeof answers === 'object' && !Array.isArray(answers)) ? answers : {};
 
-        // 1. Lấy bài kiểm tra thật từ Firestore (không tin dữ liệu exam mà client có thể gửi kèm)
-        const examSnap = await dbAdmin.collection('exams').doc(exam_id).get();
-        if (!examSnap.exists) {
-            return res.status(404).json({ message: 'Không tìm thấy bài kiểm tra.' });
+        // 1 + 2. Lấy bài kiểm tra thật + xác nhận học sinh là thành viên active
+        //         của lớp sở hữu bài này (không tin dữ liệu exam client gửi kèm).
+        const access = await loadExamForStudent(exam_id, studentId);
+        if (!access.ok) {
+            return res.status(access.status).json({ message: access.message });
         }
-        const examData = examSnap.data();
-
-        if (examData.status !== 'active') {
-            return res.status(403).json({ message: 'Bài kiểm tra đã đóng hoặc chưa mở, không thể nộp bài.' });
-        }
-
-        // 2. Xác nhận học sinh thực sự là thành viên active của lớp sở hữu bài này
-        //    (chặn trường hợp học sinh có link/roomCode nhưng chưa từng tham gia lớp)
-        const memberSnap = await dbAdmin
-            .collection('class_members')
-            .doc(`${studentId}_${examData.class_id}`)
-            .get();
-        if (!memberSnap.exists || memberSnap.data().status !== 'active') {
-            return res.status(403).json({ message: 'Bạn không phải thành viên đang hoạt động của lớp học này.' });
-        }
+        const examData = access.examData;
 
         const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
         if (questionIds.length === 0) {
@@ -219,26 +299,7 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
 
         // 3. Lấy nội dung câu hỏi thật (chia chunk 10 vì toán tử "in" giới hạn 10-30
         //    phần tử tuỳ phiên bản; giữ 10 cho an toàn, khớp cách hocsinh.js đang làm)
-        const chunks = [];
-        for (let i = 0; i < questionIds.length; i += 10) {
-            chunks.push(questionIds.slice(i, i + 10));
-        }
-        const chunkSnaps = await Promise.all(
-            chunks.map((chunk) =>
-                dbAdmin
-                    .collection('questions')
-                    .where(admin.firestore.FieldPath.documentId(), 'in', chunk)
-                    .get()
-            )
-        );
-        const questionMap = {};
-        chunkSnaps.forEach((snap) => {
-            snap.docs.forEach((d) => {
-                questionMap[d.id] = { id: d.id, ...d.data() };
-            });
-        });
-        // Giữ đúng thứ tự questionIds ban đầu; bỏ qua câu hỏi đã bị xoá khỏi ngân hàng
-        const questions = questionIds.map((id) => questionMap[id]).filter(Boolean);
+        const questions = await fetchQuestionsByIds(questionIds);
 
         // 4. CHẤM ĐIỂM THẬT — đây là phần học sinh không thể giả mạo được nữa vì
         //    toàn bộ logic này chạy trên server, dùng đáp án đúng lấy trực tiếp
@@ -296,7 +357,7 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             cheatWarnings: Number(cheatWarnings) || 0,
             cheatLogs: Array.isArray(cheatLogs) ? cheatLogs : [],
             timeUsedSeconds: Number(timeUsed) || 0,
-            submitTime: admin.firestore.FieldValue.serverTimestamp()
+            submitTime: FieldValue.serverTimestamp()
         };
 
         await dbAdmin.collection('results').doc(`${exam_id}_${studentId}`).set(payload);
@@ -337,27 +398,13 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
             return res.status(400).json({ message: 'Thiếu exam_id.' });
         }
 
-        // 1. Lấy bài kiểm tra thật (không tin dữ liệu exam client gửi kèm)
-        const examSnap = await dbAdmin.collection('exams').doc(exam_id).get();
-        if (!examSnap.exists) {
-            return res.status(404).json({ message: 'Không tìm thấy bài kiểm tra.' });
+        // 1 + 2. Lấy bài kiểm tra thật + xác nhận học sinh là thành viên active
+        //         của lớp sở hữu bài này (dùng chung logic với /api/submit-exam).
+        const access = await loadExamForStudent(exam_id, studentId);
+        if (!access.ok) {
+            return res.status(access.status).json({ message: access.message });
         }
-        const examData = examSnap.data();
-
-        if (examData.status !== 'active') {
-            return res.status(403).json({ message: 'Bài kiểm tra đã đóng hoặc chưa mở.' });
-        }
-
-        // 2. Xác nhận học sinh thực sự là thành viên active của lớp sở hữu
-        //    bài này — giống hệt bước kiểm tra trong /api/submit-exam, chặn
-        //    học sinh có roomCode nhưng chưa từng tham gia lớp "câu trộm" đề.
-        const memberSnap = await dbAdmin
-            .collection('class_members')
-            .doc(`${studentId}_${examData.class_id}`)
-            .get();
-        if (!memberSnap.exists || memberSnap.data().status !== 'active') {
-            return res.status(403).json({ message: 'Bạn không phải thành viên đang hoạt động của lớp học này.' });
-        }
+        const examData = access.examData;
 
         const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
         if (questionIds.length === 0) {
@@ -365,27 +412,7 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
         }
 
         // 3. Lấy nội dung câu hỏi thật (chia chunk 10, giống /api/submit-exam)
-        const chunks = [];
-        for (let i = 0; i < questionIds.length; i += 10) {
-            chunks.push(questionIds.slice(i, i + 10));
-        }
-        const chunkSnaps = await Promise.all(
-            chunks.map((chunk) =>
-                dbAdmin
-                    .collection('questions')
-                    .where(admin.firestore.FieldPath.documentId(), 'in', chunk)
-                    .get()
-            )
-        );
-        const questionMap = {};
-        chunkSnaps.forEach((snap) => {
-            snap.docs.forEach((d) => {
-                questionMap[d.id] = { id: d.id, ...d.data() };
-            });
-        });
-
-        // Giữ đúng thứ tự questionIds ban đầu; bỏ qua câu đã bị xoá khỏi ngân hàng
-        const orderedQuestions = questionIds.map((id) => questionMap[id]).filter(Boolean);
+        const orderedQuestions = await fetchQuestionsByIds(questionIds);
 
         // 4. SANITIZE — bước quan trọng nhất. Bỏ sót 1 trường ở đây là lỗ
         //    hổng 0.2 coi như vẫn còn nguyên, chỉ đổi chỗ rò rỉ.
