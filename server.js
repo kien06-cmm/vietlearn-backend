@@ -308,6 +308,111 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
     }
 });
 
+/**
+ * --- API Lấy câu hỏi cho học sinh làm bài (ĐÃ SANITIZE ĐÁP ÁN ĐÚNG) ---
+ *
+ * FIX BẢO MẬT (mục 0.2 báo cáo): trước đây hocsinh.js đọc thẳng collection
+ * "questions" qua Firestore SDK (rule "allow read: if signedIn();"), nghĩa
+ * là bất kỳ học sinh nào mở DevTools cũng lấy được TOÀN BỘ đáp án đúng của
+ * TOÀN BỘ ngân hàng câu hỏi (không chỉ bài đang thi), vì Firestore Rules
+ * không thể lọc field trong response — chỉ chặn được toàn bộ document hoặc
+ * không gì cả.
+ *
+ * Từ giờ: học sinh KHÔNG còn quyền đọc "questions" trực tiếp (xem
+ * firestore.rules mục 5 đã khoá lại "chỉ giáo viên sở hữu"). Mọi câu hỏi
+ * học sinh cần để làm bài phải đi qua endpoint này — nơi Backend (Admin
+ * SDK, bypass Rules) chủ động XOÁ SẠCH mọi trường chứa đáp án đúng trước
+ * khi trả JSON, nên kể cả bắt được response qua tab Network cũng không
+ * thấy đáp án đúng nằm ở đâu.
+ *
+ * Payload: { exam_id: string }
+ * Header:  Authorization: Bearer <Firebase ID Token>
+ */
+app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
+    try {
+        const studentId = req.uid; // từ token đã xác thực, không tin body
+        const { exam_id } = req.body;
+
+        if (!exam_id || typeof exam_id !== 'string') {
+            return res.status(400).json({ message: 'Thiếu exam_id.' });
+        }
+
+        // 1. Lấy bài kiểm tra thật (không tin dữ liệu exam client gửi kèm)
+        const examSnap = await dbAdmin.collection('exams').doc(exam_id).get();
+        if (!examSnap.exists) {
+            return res.status(404).json({ message: 'Không tìm thấy bài kiểm tra.' });
+        }
+        const examData = examSnap.data();
+
+        if (examData.status !== 'active') {
+            return res.status(403).json({ message: 'Bài kiểm tra đã đóng hoặc chưa mở.' });
+        }
+
+        // 2. Xác nhận học sinh thực sự là thành viên active của lớp sở hữu
+        //    bài này — giống hệt bước kiểm tra trong /api/submit-exam, chặn
+        //    học sinh có roomCode nhưng chưa từng tham gia lớp "câu trộm" đề.
+        const memberSnap = await dbAdmin
+            .collection('class_members')
+            .doc(`${studentId}_${examData.class_id}`)
+            .get();
+        if (!memberSnap.exists || memberSnap.data().status !== 'active') {
+            return res.status(403).json({ message: 'Bạn không phải thành viên đang hoạt động của lớp học này.' });
+        }
+
+        const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
+        if (questionIds.length === 0) {
+            return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
+        }
+
+        // 3. Lấy nội dung câu hỏi thật (chia chunk 10, giống /api/submit-exam)
+        const chunks = [];
+        for (let i = 0; i < questionIds.length; i += 10) {
+            chunks.push(questionIds.slice(i, i + 10));
+        }
+        const chunkSnaps = await Promise.all(
+            chunks.map((chunk) =>
+                dbAdmin
+                    .collection('questions')
+                    .where(admin.firestore.FieldPath.documentId(), 'in', chunk)
+                    .get()
+            )
+        );
+        const questionMap = {};
+        chunkSnaps.forEach((snap) => {
+            snap.docs.forEach((d) => {
+                questionMap[d.id] = { id: d.id, ...d.data() };
+            });
+        });
+
+        // Giữ đúng thứ tự questionIds ban đầu; bỏ qua câu đã bị xoá khỏi ngân hàng
+        const orderedQuestions = questionIds.map((id) => questionMap[id]).filter(Boolean);
+
+        // 4. SANITIZE — bước quan trọng nhất. Bỏ sót 1 trường ở đây là lỗ
+        //    hổng 0.2 coi như vẫn còn nguyên, chỉ đổi chỗ rò rỉ.
+        const sanitizedQuestions = orderedQuestions.map((q) => {
+            const clean = { ...q };
+
+            if (Array.isArray(clean.answers)) {
+                clean.answers = clean.answers.map((ans) => {
+                    if (!ans || typeof ans !== 'object') return ans;
+                    const { correct, ...rest } = ans; // bỏ field "correct"
+                    return rest;
+                });
+            }
+
+            delete clean.correctAnswer; // schema cũ (options[] + correctAnswer)
+            delete clean.essayAnswer;   // đáp án mẫu tự luận
+
+            return clean;
+        });
+
+        return res.json({ questions: sanitizedQuestions });
+    } catch (error) {
+        console.error('Lỗi lấy câu hỏi cho học sinh:', error);
+        return res.status(500).json({ message: 'Lỗi server khi tải câu hỏi.' });
+    }
+});
+
 // Lệnh này bắt buộc phải có để server không bị "thoát sớm"
 app.listen(PORT, () => {
     console.log(`Server đang chạy tại port ${PORT}`);
