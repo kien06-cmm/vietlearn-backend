@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
-const { GoogleGenerativeAI } = require('@google/generative-ai'); // Đã thêm thư viện Gemini
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 
@@ -18,27 +18,73 @@ app.get('/', (req, res) => {
     res.send('🚀 VietLearn Backend API đang hoạt động mượt mà!');
 });
 
-// Đường dẫn API bóc tách tài liệu (Claude sẽ gọi vào đây)
+// --- API Xử lý Bóc tách tài liệu (PDF/Word/Forms) ---
 app.post('/api/extract-questions', async (req, res) => {
     try {
         const { source, mimeType, fileBase64, formsUrl } = req.body;
         console.log("Đã nhận yêu cầu xử lý từ frontend:", source);
         
-        // TODO: Chèn logic gọi các file lib/gemini.js vào đây sau
-        res.json({ questions: [{ question: "Server đã nhận được API thành công!" }]});
+        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        // Sử dụng model Gemini 3.5 Flash Lite siêu tốc
+        const model = genAI.getGenerativeModel({ 
+            model: "gemini-3.5-flash-lite",
+            systemInstruction: `Bạn là trợ lý AI chuyên phân tích tài liệu giáo dục. Nhiệm vụ của bạn là bóc tách các câu hỏi trong tài liệu và trả về MỘT MẢNG JSON duy nhất chứa các câu hỏi theo đúng định dạng sau:
+[
+  {
+    "question": "Nội dung câu hỏi",
+    "type": "multiple_choice" | "essay" | "true_false",
+    "subject": "Tên môn học",
+    "grade": "Khối lớp (ví dụ: 10, 11, 12)",
+    "difficulty": "easy" | "medium" | "hard",
+    "score": 1,
+    "answers": [{"text": "Đáp án A", "correct": true}, {"text": "Đáp án B", "correct": false}] (Dùng cho trắc nghiệm),
+    "essayAnswer": "Đáp án tự luận mẫu" (Dùng cho tự luận)
+  }
+]
+TUYỆT ĐỐI CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG KÝ HIỆU MARKDOWN HAY GIẢI THÍCH.`
+        });
+
+        let promptText = "";
+        let requestContent = [];
+
+        if (source === 'file' && fileBase64) {
+            promptText = "Hãy bóc tách tất cả các câu hỏi có trong tài liệu đính kèm này.";
+            requestContent = [
+                promptText,
+                {
+                    inlineData: {
+                        data: fileBase64,
+                        mimeType: mimeType || "application/pdf"
+                    }
+                }
+            ];
+        } else if (source === 'google-forms' && formsUrl) {
+             promptText = `Hãy phân tích đường link Google Forms sau đây và bóc tách các câu hỏi: ${formsUrl}`;
+             requestContent = [promptText];
+        } else {
+             return res.status(400).json({ message: "Thiếu dữ liệu đầu vào (file hoặc link)." });
+        }
+
+        const result = await model.generateContent(requestContent);
+        let text = result.response.text().replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+        
+        // Trả về đúng định dạng { questions: [...] } mà Frontend yêu cầu
+        res.json({ questions: JSON.parse(text) });
+
     } catch (error) {
-        console.error("Lỗi:", error);
-        res.status(500).json({ error: error.message });
+        console.error("Lỗi bóc tách tài liệu:", error);
+        res.status(500).json({ message: "Lỗi server khi bóc tách tài liệu." });
     }
 });
 
-// --- ĐÃ THÊM: API Xử lý biên dịch Toán học ---
+// --- API Xử lý biên dịch Toán học ---
 app.post('/api/compile-math', async (req, res) => {
     try {
         const { input } = req.body;
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        // Đồng bộ model 3.5 Flash Lite cho phần Toán học
         const model = genAI.getGenerativeModel({
-            model: "gemini-1.5-flash",
+            model: "gemini-3.5-flash-lite",
             systemInstruction: "Bạn là bộ chuyển đổi công thức Toán học sang mã LaTeX. CHỈ TRẢ VỀ JSON THUẦN TÚY với cấu trúc: {\"ok\": true, \"type\": \"math\"|\"chemistry\", \"latex\": \"mã_latex\"}. KHÔNG bọc trong markdown hay ký hiệu $ hay $$. TUYỆT ĐỐI không chào hỏi hay giải thích."
         });
         const result = await model.generateContent(input);
@@ -49,7 +95,6 @@ app.post('/api/compile-math', async (req, res) => {
         res.status(500).json({ ok: false, error: "Lỗi server khi biên dịch toán." });
     }
 });
-// ----------------------------------------------
 
 // Lệnh này bắt buộc phải có để server không bị "thoát sớm"
 app.listen(PORT, () => {
