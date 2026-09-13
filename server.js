@@ -47,6 +47,20 @@ const { getAuth } = require('firebase-admin/auth');
 let dbAdmin;
 let authAdmin;
 
+// FIX (chẩn đoán nhanh trên Render): kiểm tra riêng từng biến môi trường
+// TRƯỚC KHI gọi cert(), vì lỗi gốc từ firebase-admin ("Service account
+// object must contain a string 'project_id' property") không cho biết
+// CHÍNH XÁC biến nào trong 3 biến đang thiếu/rỗng — có thể chỉ 1 hoặc cả
+// 3. Log dưới đây chỉ đích danh, đỡ phải đoán khi debug trên Render.
+const requiredEnvVars = ['FIREBASE_PROJECT_ID', 'FIREBASE_CLIENT_EMAIL', 'FIREBASE_PRIVATE_KEY'];
+const missingEnvVars = requiredEnvVars.filter((key) => !process.env[key] || process.env[key].trim() === '');
+
+if (missingEnvVars.length > 0) {
+    console.error(`❌ Thiếu biến môi trường bắt buộc trên Render: ${missingEnvVars.join(', ')}`);
+    console.error('   Vào Render Dashboard -> service này -> tab "Environment" -> kiểm tra đủ 3 biến FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY (đúng tên, không rỗng), rồi deploy lại.');
+    process.exit(1);
+}
+
 try {
     const firebaseApp = initializeApp({
         credential: cert({
