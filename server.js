@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // Đã thêm thư viện Gemini
 
 const app = express();
 
@@ -30,6 +31,25 @@ app.post('/api/extract-questions', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
+// --- ĐÃ THÊM: API Xử lý biên dịch Toán học ---
+app.post('/api/compile-math', async (req, res) => {
+    try {
+        const { input } = req.body;
+        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        const model = genAI.getGenerativeModel({
+            model: "gemini-1.5-flash",
+            systemInstruction: "Bạn là bộ chuyển đổi công thức Toán học sang mã LaTeX. CHỈ TRẢ VỀ JSON THUẦN TÚY với cấu trúc: {\"ok\": true, \"type\": \"math\"|\"chemistry\", \"latex\": \"mã_latex\"}. KHÔNG bọc trong markdown hay ký hiệu $ hay $$. TUYỆT ĐỐI không chào hỏi hay giải thích."
+        });
+        const result = await model.generateContent(input);
+        let text = result.response.text().replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+        res.json(JSON.parse(text));
+    } catch (error) {
+        console.error("Lỗi biên dịch Toán:", error);
+        res.status(500).json({ ok: false, error: "Lỗi server khi biên dịch toán." });
+    }
+});
+// ----------------------------------------------
 
 // Lệnh này bắt buộc phải có để server không bị "thoát sớm"
 app.listen(PORT, () => {
