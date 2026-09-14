@@ -136,6 +136,19 @@ function getCorrectIndexServer(q) {
 }
 
 /**
+ * Đọc danh sách text các đáp án, hỗ trợ cả 2 dạng schema (xem comment ở
+ * getCorrectIndexServer) — dùng cho /api/get-result-detail để trả về danh
+ * sách đáp án đã chuẩn hoá, khớp đúng cách hocsinh.js hiển thị lúc làm bài
+ * (hàm getOptionTexts() phía client cùng logic).
+ */
+function getOptionTextsServer(q) {
+    if (Array.isArray(q.answers)) {
+        return q.answers.map((a) => (a && typeof a.text === 'string') ? a.text : '');
+    }
+    return Array.isArray(q.options) ? q.options : [];
+}
+
+/**
  * Xác nhận học sinh (studentId) thực sự là thành viên active của lớp sở
  * hữu 1 bài kiểm tra cụ thể — dùng chung cho cả /api/submit-exam và
  * /api/get-exam-questions để tránh lặp code và đảm bảo 2 API áp cùng 1
@@ -390,6 +403,11 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             score,
             correctCount,
             totalQuestions,
+            // FIX (mục 1.4 báo cáo): trước đây KHÔNG lưu đáp án học sinh đã
+            // chọn vào "results", nên màn "Xem lại" không có gì để tô đỏ đáp
+            // án sai. answers vẫn là safeAnswers đã chấm điểm thật ở bước 4
+            // (không tin dữ liệu client gửi thêm sau khi đã dùng để chấm).
+            answers: safeAnswers,
             cheatWarnings: Number(cheatWarnings) || 0,
             cheatLogs: Array.isArray(cheatLogs) ? cheatLogs : [],
             timeUsedSeconds: Number(timeUsed) || 0,
@@ -473,6 +491,77 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
     } catch (error) {
         console.error('Lỗi lấy câu hỏi cho học sinh:', error);
         return res.status(500).json({ message: 'Lỗi server khi tải câu hỏi.' });
+    }
+});
+
+/**
+ * --- API Lấy chi tiết bài làm để học sinh "Xem lại" (mục 1.4 báo cáo) ---
+ *
+ * Học sinh không còn quyền đọc "questions" trực tiếp (đã khoá ở
+ * firestore.rules mục 5), nên không thể tự ghép câu hỏi + đáp án đúng +
+ * đáp án đã chọn để hiển thị màn xem lại. Backend (Admin SDK, bypass Rules)
+ * đọc cả "results" lẫn "questions" rồi ghép sẵn thành 1 mảng báo cáo hoàn
+ * chỉnh, đã lọc bỏ mọi field thừa (không trả nguyên document thô), trả
+ * thẳng về Frontend.
+ *
+ * Payload: { result_id: string }   // chính là "{exam_id}_{student_id}"
+ * Header:  Authorization: Bearer <Firebase ID Token>
+ */
+app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { result_id } = req.body;
+        if (!result_id || typeof result_id !== 'string') {
+            return res.status(400).json({ message: 'Thiếu result_id.' });
+        }
+
+        // 1 + 2. Đọc document "results/{result_id}" bằng Admin SDK.
+        const resultSnap = await dbAdmin.collection('results').doc(result_id).get();
+        if (!resultSnap.exists) {
+            return res.status(404).json({ message: 'Không tìm thấy bài làm.' });
+        }
+        const resultData = resultSnap.data();
+
+        // 3. Bảo mật: chỉ chính học sinh đã làm bài này mới được xem lại —
+        //    chặn học sinh tự sửa result_id trên DevTools để xem đáp án của
+        //    người khác. So sánh với uid THẬT từ token, không tin body.
+        if (resultData.student_id !== req.uid) {
+            return res.status(403).json({ message: 'Bạn không có quyền xem bài làm của người khác.' });
+        }
+
+        // 4. Lấy danh sách câu hỏi thật của bài kiểm tra tương ứng (chia
+        //    chunk 10, dùng chung fetchQuestionsByIds với 2 API còn lại).
+        const examSnap = await dbAdmin.collection('exams').doc(resultData.exam_id).get();
+        const questionIds = (examSnap.exists && Array.isArray(examSnap.data().questionIds))
+            ? examSnap.data().questionIds
+            : [];
+
+        const questions = await fetchQuestionsByIds(questionIds);
+        const studentAnswers = (resultData.answers && typeof resultData.answers === 'object')
+            ? resultData.answers
+            : {};
+
+        // 5. Ghép correctAnswer + explanation + studentAnswer cho từng câu,
+        //    chuẩn hoá về đúng 1 dạng { text, options[], correctAnswer,
+        //    studentAnswer, explanation } bất kể câu hỏi lưu theo schema nào
+        //    (options[]+correctAnswer HAY answers[{text,correct}]) — dùng
+        //    chung getOptionTextsServer/getCorrectIndexServer với
+        //    /api/submit-exam để không lệch với logic chấm điểm thật. Chỉ
+        //    trả đúng field Frontend cần hiển thị, lọc bỏ mọi thứ thừa
+        //    (score câu hỏi, teacher_id, metadata nội bộ...).
+        const detail = questions.map((q) => ({
+            id: q.id,
+            text: q.question || q.text || '',
+            options: getOptionTextsServer(q),
+            correctAnswer: getCorrectIndexServer(q),
+            studentAnswer: typeof studentAnswers[q.id] === 'number' ? studentAnswers[q.id] : null,
+            explanation: typeof q.explanation === 'string' ? q.explanation : ''
+        }));
+
+        // 6. Trả mảng báo cáo chi tiết về Frontend.
+        return res.json(detail);
+    } catch (error) {
+        console.error('Lỗi lấy chi tiết bài làm:', error);
+        return res.status(500).json({ message: 'Lỗi server khi tải chi tiết bài làm.' });
     }
 });
 
