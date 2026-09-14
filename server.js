@@ -291,7 +291,20 @@ app.post('/api/compile-math', async (req, res) => {
 app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
     try {
         const studentId = req.uid; // Lấy từ token đã xác thực, KHÔNG lấy từ body
-        const { exam_id, answers, timeUsed, cheatWarnings, cheatLogs } = req.body;
+        const {
+            exam_id, answers, timeUsed, cheatWarnings, cheatLogs,
+            // Denormalize (mục 1.3 báo cáo): các field hiển thị hocsinh.js gửi kèm
+            // lúc nộp bài để ghi thẳng vào "results", tránh bảng điểm ketqua.js
+            // phải join thêm collection khác (đặc biệt "className" — examData
+            // hiện chỉ có class_id chứ không có tên lớp, nên đây là NGUỒN DUY
+            // NHẤT có className). studentName/quizName/subject vẫn ưu tiên giá
+            // trị lấy từ hồ sơ/exam thật ở server (xem bước 5 & 6 bên dưới) —
+            // giá trị client gửi chỉ dùng làm dự phòng khi server không có sẵn.
+            studentName: clientStudentName,
+            className,
+            quizName: clientQuizName,
+            subject: clientSubject
+        } = req.body;
 
         if (!exam_id || typeof exam_id !== 'string') {
             return res.status(400).json({ message: 'Thiếu exam_id.' });
@@ -340,7 +353,8 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         const totalQuestions = questions.length;
         const score = totalPoints > 0 ? Number(((earnedPoints / totalPoints) * 10).toFixed(1)) : 0;
 
-        // 5. Lấy tên học sinh thật từ hồ sơ (không tin studentName client tự gửi)
+        // 5. Lấy tên học sinh thật từ hồ sơ (không tin studentName client tự gửi
+        //    làm nguồn CHÍNH — chỉ dùng làm dự phòng nếu hồ sơ không có tên).
         let studentName = 'Học sinh';
         try {
             const userSnap = await dbAdmin.collection('users').doc(studentId).get();
@@ -350,6 +364,9 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             }
         } catch (nameErr) {
             console.error('Không lấy được tên học sinh (không chặn việc chấm điểm):', nameErr.message);
+        }
+        if (studentName === 'Học sinh' && typeof clientStudentName === 'string' && clientStudentName.trim()) {
+            studentName = clientStudentName.trim();
         }
 
         // 6. Ghi kết quả bằng Admin SDK — bypass Firestore Rules hoàn toàn,
@@ -361,10 +378,15 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             student_id: studentId,
             studentName,
             class_id: examData.class_id || '',
-            subject: examData.subject || '',
+            // FIX (mục 1.3 báo cáo): examData không có sẵn tên lớp (chỉ có
+            // class_id), nên className CHỈ có thể lấy từ giá trị client gửi
+            // kèm lúc nộp bài. Đây là field hiển thị (không ảnh hưởng điểm số),
+            // nên chấp nhận dùng trực tiếp giá trị từ req.body.
+            className: (typeof className === 'string' && className.trim()) ? className.trim() : 'Không xác định',
+            subject: examData.subject || (typeof clientSubject === 'string' ? clientSubject : ''),
             // FIX kèm theo: exam dùng field "quizName" (không phải "title") —
             // xem mục 1.1 báo cáo. Đọc đúng field thật để không ghi results rỗng.
-            quizName: examData.quizName || examData.title || '',
+            quizName: examData.quizName || examData.title || (typeof clientQuizName === 'string' ? clientQuizName : ''),
             score,
             correctCount,
             totalQuestions,
