@@ -712,9 +712,29 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
  * Học sinh không còn quyền đọc "questions" trực tiếp (đã khoá ở
  * firestore.rules mục 5), nên không thể tự ghép câu hỏi + đáp án đúng +
  * đáp án đã chọn để hiển thị màn xem lại. Backend (Admin SDK, bypass Rules)
- * đọc cả "results" lẫn "questions" rồi ghép sẵn thành 1 mảng báo cáo hoàn
- * chỉnh, đã lọc bỏ mọi field thừa (không trả nguyên document thô), trả
- * thẳng về Frontend.
+ * đọc cả "results" lẫn "questions" rồi ghép sẵn thành báo cáo hoàn chỉnh.
+ *
+ * FIX (mục 1.4 báo cáo — bản trước LUÔN trả full đáp án đúng + giải thích,
+ * BỎ QUA hoàn toàn 3 cờ cấu hình của giáo viên trong "exams". Nghĩa là dù
+ * giáo viên tắt showScoreImmediately/showCorrectAnswers/showExplanation,
+ * học sinh vẫn có thể tự gọi thẳng endpoint này qua DevTools để xem trước
+ * đáp án đúng và lời giải — cùng một lỗ hổng "0.2" đã vá cho lúc làm bài,
+ * chỉ là lộ ra ở một endpoint khác). Giờ áp dụng ĐÚNG 3 cờ, theo thứ tự
+ * lồng nhau (khớp yêu cầu Task 1.4):
+ *
+ *   showScoreImmediately == false
+ *     -> KHÔNG trả score/correctCount/skippedCount/totalQuestions, và
+ *        KHÔNG trả câu hỏi/đáp án gì cả (kể cả khi 2 cờ dưới đang bật).
+ *   showScoreImmediately == true
+ *     -> trả điểm số + số câu đúng/sai/bỏ qua.
+ *     showCorrectAnswers == true
+ *       -> trả thêm danh sách câu hỏi kèm đáp án học sinh đã chọn +
+ *          đáp án đúng thực sự (để Frontend tô Xanh/Đỏ).
+ *       showExplanation == true
+ *         -> mỗi câu có thêm trả về "Lời giải chi tiết".
+ *
+ * Nếu muốn 3 cờ độc lập với nhau (không lồng), bỏ phần "&&
+ * showScoreImmediately"/"&& showCorrectAnswers" ở 2 dòng tính cờ bên dưới.
  *
  * Payload: { result_id: string }   // chính là "{exam_id}_{student_id}"
  * Header:  Authorization: Bearer <Firebase ID Token>
@@ -740,37 +760,78 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
             return res.status(403).json({ message: 'Bạn không có quyền xem bài làm của người khác.' });
         }
 
-        // 4. Lấy danh sách câu hỏi thật của bài kiểm tra tương ứng (chia
-        //    chunk 10, dùng chung fetchQuestionsByIds với 2 API còn lại).
+        // 4. Lấy cờ cấu hình hiển thị từ "exams" — nguồn DUY NHẤT quyết định
+        //    học sinh được xem gì. Exam bị xoá / thiếu field -> coi như tắt
+        //    hết (an toàn hơn là mặc định lộ đáp án).
         const examSnap = await dbAdmin.collection('exams').doc(resultData.exam_id).get();
-        const questionIds = (examSnap.exists && Array.isArray(examSnap.data().questionIds))
-            ? examSnap.data().questionIds
-            : [];
+        const examData = examSnap.exists ? examSnap.data() : {};
 
-        const questions = await fetchQuestionsByIds(questionIds);
-        const studentAnswers = (resultData.answers && typeof resultData.answers === 'object')
-            ? resultData.answers
-            : {};
+        const scoreVisible = examData.showScoreImmediately === true;
+        const questionsVisible = scoreVisible && examData.showCorrectAnswers === true;
+        const explanationVisible = questionsVisible && examData.showExplanation === true;
 
-        // 5. Ghép correctAnswer + explanation + studentAnswer cho từng câu,
-        //    chuẩn hoá về đúng 1 dạng { text, options[], correctAnswer,
-        //    studentAnswer, explanation } bất kể câu hỏi lưu theo schema nào
-        //    (options[]+correctAnswer HAY answers[{text,correct}]) — dùng
-        //    chung getOptionTextsServer/getCorrectIndexServer với
-        //    /api/submit-exam để không lệch với logic chấm điểm thật. Chỉ
-        //    trả đúng field Frontend cần hiển thị, lọc bỏ mọi thứ thừa
-        //    (score câu hỏi, teacher_id, metadata nội bộ...).
-        const detail = questions.map((q) => ({
-            id: q.id,
-            text: q.question || q.text || '',
-            options: getOptionTextsServer(q),
-            correctAnswer: getCorrectIndexServer(q),
-            studentAnswer: typeof studentAnswers[q.id] === 'number' ? studentAnswers[q.id] : null,
-            explanation: typeof q.explanation === 'string' ? q.explanation : ''
-        }));
+        // 5. "details" ĐẦY ĐỦ đã được /api/submit-exam lưu sẵn vào "results"
+        //    bất kể cờ hiển thị (xem ghi chú ở đó) — dùng lại để tính số câu
+        //    đúng/sai/bỏ qua, KHÔNG cần chấm lại.
+        const fullDetails = Array.isArray(resultData.details) ? resultData.details : [];
+        const totalQuestions = Number(resultData.totalQuestions) || fullDetails.length;
+        const correctCount = Number(resultData.correctCount) || 0;
+        const skippedCount = fullDetails.filter(
+            (d) => d.studentAnswer === null || d.studentAnswer === undefined
+        ).length;
+        const incorrectCount = Math.max(0, totalQuestions - correctCount - skippedCount);
 
-        // 6. Trả mảng báo cáo chi tiết về Frontend.
-        return res.json(detail);
+        const responsePayload = {
+            ok: true,
+            studentName: resultData.studentName || '',
+            quizName: resultData.quizName || '',
+            className: resultData.className || '',
+            subject: resultData.subject || '',
+            submitTime: (resultData.submitTime && typeof resultData.submitTime.toDate === 'function')
+                ? resultData.submitTime.toDate().toISOString()
+                : null,
+            scoreVisible,
+            questionsVisible,
+            explanationVisible
+        };
+
+        if (scoreVisible) {
+            responsePayload.score = resultData.score;
+            responsePayload.correctCount = correctCount;
+            responsePayload.incorrectCount = incorrectCount;
+            responsePayload.skippedCount = skippedCount;
+            responsePayload.totalQuestions = totalQuestions;
+        }
+
+        if (questionsVisible) {
+            // Chỉ khi được phép xem đáp án mới cần chọc vào "questions" lấy
+            // text + các phương án (details đã có sẵn correctAnswer/isCorrect
+            // rồi, không cần tính lại bằng getCorrectIndexServer).
+            const questionIds = fullDetails.map((d) => d.questionId).filter(Boolean);
+            const questions = await fetchQuestionsByIds(questionIds);
+            const questionMap = {};
+            questions.forEach((q) => { questionMap[q.id] = q; });
+
+            responsePayload.questions = fullDetails.map((d) => {
+                const q = questionMap[d.questionId] || {};
+                const item = {
+                    id: d.questionId,
+                    text: q.question || q.text || '',
+                    options: getOptionTextsServer(q),
+                    studentAnswer: typeof d.studentAnswer === 'number' ? d.studentAnswer : null,
+                    correctAnswer: typeof d.correctAnswer === 'number' ? d.correctAnswer : -1,
+                    isCorrect: d.isCorrect === true
+                };
+                if (explanationVisible) {
+                    item.explanation = typeof d.explanation === 'string' ? d.explanation : '';
+                }
+                return item;
+            });
+        }
+
+        // 6. Trả báo cáo đã lọc sẵn theo cờ — Frontend chỉ việc render đúng
+        //    những gì server gửi, không tự suy diễn/ước lượng thêm.
+        return res.json(responsePayload);
     } catch (error) {
         console.error('Lỗi lấy chi tiết bài làm:', error);
         return res.status(500).json({ message: 'Lỗi server khi tải chi tiết bài làm.' });
