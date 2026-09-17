@@ -209,6 +209,161 @@ async function fetchQuestionsByIds(questionIds) {
     return questionIds.map((id) => questionMap[id]).filter(Boolean);
 }
 
+/**
+ * Biến thể của loadExamForStudent() nhưng tra theo roomCode thay vì exam_id
+ * — dùng cho GET /api/get-exam-questions (khớp luồng thật của
+ * lam_bai.html?code=...). Tự query "exams" theo roomCode + status=='active'
+ * ngay trên server (không tin exam_id do client tự gửi lên), rồi soát cùng
+ * điều kiện thành viên lớp active như bản gốc.
+ */
+async function loadExamForStudentByRoomCode(roomCode, studentId) {
+    const examsSnap = await dbAdmin
+        .collection('exams')
+        .where('roomCode', '==', roomCode)
+        .where('status', '==', 'active')
+        .limit(1)
+        .get();
+
+    if (examsSnap.empty) {
+        return { ok: false, status: 404, message: 'Mã phòng không tồn tại hoặc đã đóng.' };
+    }
+
+    const examDoc = examsSnap.docs[0];
+    const examData = examDoc.data();
+
+    const memberSnap = await dbAdmin
+        .collection('class_members')
+        .doc(`${studentId}_${examData.class_id}`)
+        .get();
+    if (!memberSnap.exists || memberSnap.data().status !== 'active') {
+        return { ok: false, status: 403, message: 'Bạn không phải thành viên đang hoạt động của lớp học này.' };
+    }
+
+    return { ok: true, examId: examDoc.id, examData };
+}
+
+/**
+ * Xáo mảng theo Fisher-Yates, dùng PRNG (mulberry32) được seed bằng 1 chuỗi
+ * cố định (examId + studentId) -> luôn ra CÙNG 1 thứ tự cho cùng 1 học sinh
+ * + cùng 1 bài thi, kể cả khi họ reload lại trang giữa chừng (tránh đổi thứ
+ * tự liên tục gây rối, vì đáp án vẫn được lưu theo questionId nên việc xáo
+ * thứ tự không ảnh hưởng gì tới độ chính xác khi chấm điểm).
+ */
+function seededShuffle(array, seedString) {
+    let seed = 0;
+    for (let i = 0; i < seedString.length; i++) {
+        seed = (Math.imul(seed, 31) + seedString.charCodeAt(i)) | 0;
+    }
+
+    function nextRandom() {
+        seed |= 0;
+        seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+
+    const result = array.slice();
+    for (let i = result.length - 1; i > 0; i--) {
+        const j = Math.floor(nextRandom() * (i + 1));
+        [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result;
+}
+
+/**
+ * --- API Lấy câu hỏi theo Mã phòng thi (GET, dùng cho luồng lam_bai.js) ---
+ *
+ * Khác với /api/get-exam-questions (POST, nhận exam_id) ở dưới — vẫn giữ
+ * nguyên để không phá vỡ bất kỳ chỗ nào khác đang gọi nó — bản GET này nhận
+ * thẳng roomCode qua query string, khớp đúng URL thật lam_bai.html?code=...,
+ * và cộng thêm 2 lớp mới:
+ *
+ *   - Giới hạn số lần làm bài (examData.maxAttempts): đếm qua collection
+ *     RIÊNG "exam_attempts" (không đếm trực tiếp "results", vì "results"
+ *     hiện dùng doc id cố định "{examId}_{studentId}" nên bị GHI ĐÈ mỗi lần
+ *     nộp lại — không phản ánh đúng số lần đã làm thật). "exam_attempts"
+ *     được cộng dồn (increment) mỗi lần /api/submit-exam chấm điểm thành
+ *     công — xem đoạn code tương ứng ở endpoint đó.
+ *   - shuffleQuestions: nếu examData bật cờ này, xáo thứ tự câu hỏi bằng
+ *     seed cố định theo (examId + studentId).
+ *
+ * Query:  ?code=<roomCode>
+ * Header: Authorization: Bearer <Firebase ID Token>
+ */
+app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
+    try {
+        const studentId = req.uid; // Từ token đã xác thực — KHÔNG tin bất kỳ studentId nào trên query string
+        const roomCode = typeof req.query.code === 'string' ? req.query.code.trim() : '';
+
+        if (!roomCode) {
+            return res.status(400).json({ message: 'Thiếu mã phòng thi (code).' });
+        }
+
+        // 1 + 2. Tìm bài thi theo roomCode + xác nhận học sinh là thành viên active của lớp.
+        const access = await loadExamForStudentByRoomCode(roomCode, studentId);
+        if (!access.ok) {
+            return res.status(access.status).json({ message: access.message });
+        }
+        const { examId, examData } = access;
+
+        // 3. Giới hạn số lần làm bài, nếu giáo viên có cấu hình maxAttempts > 0.
+        const maxAttempts = Number(examData.maxAttempts) > 0 ? Number(examData.maxAttempts) : null;
+        if (maxAttempts !== null) {
+            const attemptSnap = await dbAdmin.collection('exam_attempts').doc(`${examId}_${studentId}`).get();
+            const usedAttempts = attemptSnap.exists ? (Number(attemptSnap.data().count) || 0) : 0;
+
+            if (usedAttempts >= maxAttempts) {
+                return res.status(403).json({ message: 'Bạn đã hết số lần làm bài cho phép đối với bài kiểm tra này.' });
+            }
+        }
+
+        const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
+        if (questionIds.length === 0) {
+            return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
+        }
+
+        // 4. Lấy nội dung câu hỏi thật (chia chunk 10, dùng chung fetchQuestionsByIds).
+        let orderedQuestions = await fetchQuestionsByIds(questionIds);
+
+        // 4b. Xáo thứ tự câu hỏi nếu giáo viên bật shuffleQuestions.
+        if (examData.shuffleQuestions === true) {
+            orderedQuestions = seededShuffle(orderedQuestions, `${examId}_${studentId}`);
+        }
+
+        // 5. SANITIZE — bước quan trọng nhất: xoá sạch mọi trường chứa đáp án
+        //    đúng trước khi trả JSON (xem ghi chú đầy đủ ở bản POST bên dưới).
+        const sanitizedQuestions = orderedQuestions.map((q) => {
+            const clean = { ...q };
+
+            if (Array.isArray(clean.answers)) {
+                clean.answers = clean.answers.map((ans) => {
+                    if (!ans || typeof ans !== 'object') return ans;
+                    const { correct, ...rest } = ans;
+                    return rest;
+                });
+            }
+
+            delete clean.correctAnswer;
+            delete clean.essayAnswer;
+
+            return clean;
+        });
+
+        return res.json({
+            examId,
+            title: examData.quizName || examData.title || '',
+            duration: examData.duration || 15,
+            allowSkip: examData.allowSkip !== false,
+            allowFlagForReview: examData.allowFlagForReview === true,
+            questions: sanitizedQuestions
+        });
+    } catch (error) {
+        console.error('Lỗi lấy câu hỏi theo mã phòng:', error);
+        return res.status(500).json({ message: 'Lỗi server khi tải câu hỏi.' });
+    }
+});
+
 // --- API Xử lý Bóc tách tài liệu (PDF/Word/Forms) ---
 app.post('/api/extract-questions', async (req, res) => {
     try {
@@ -349,6 +504,12 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         let correctCount = 0;
         let earnedPoints = 0;
         let totalPoints = 0;
+        // Mảng đối chiếu ĐẦY ĐỦ — LUÔN được lưu full vào "results" bất kể cờ
+        // hiển thị của giáo viên, để dùng cho giáo viên xem/chấm và cho học
+        // sinh "Xem lại" sau này qua /api/get-result-detail. Việc ẩn bớt field
+        // theo showCorrectAnswers/showExplanation CHỈ áp dụng lên response trả
+        // về ngay lúc nộp bài (xem bước 7 bên dưới), không áp lên dữ liệu lưu.
+        const details = [];
 
         questions.forEach((q) => {
             const points = Number(q.score) > 0 ? Number(q.score) : 1;
@@ -356,11 +517,21 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
 
             const correctIndex = getCorrectIndexServer(q);
             const studentAnswer = safeAnswers[q.id];
+            const isCorrect = correctIndex !== -1 && studentAnswer === correctIndex;
 
-            if (correctIndex !== -1 && studentAnswer === correctIndex) {
+            if (isCorrect) {
                 correctCount += 1;
                 earnedPoints += points;
             }
+
+            details.push({
+                questionId: q.id,
+                studentAnswer: typeof studentAnswer === 'number' ? studentAnswer : null,
+                correctAnswer: correctIndex,
+                isCorrect,
+                points,
+                explanation: typeof q.explanation === 'string' ? q.explanation : ''
+            });
         });
 
         const totalQuestions = questions.length;
@@ -408,6 +579,7 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             // án sai. answers vẫn là safeAnswers đã chấm điểm thật ở bước 4
             // (không tin dữ liệu client gửi thêm sau khi đã dùng để chấm).
             answers: safeAnswers,
+            details,
             cheatWarnings: Number(cheatWarnings) || 0,
             cheatLogs: Array.isArray(cheatLogs) ? cheatLogs : [],
             timeUsedSeconds: Number(timeUsed) || 0,
@@ -416,7 +588,47 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
 
         await dbAdmin.collection('results').doc(`${exam_id}_${studentId}`).set(payload);
 
-        return res.json({ ok: true, score, correctCount, totalQuestions });
+        // Cộng dồn số lần đã làm bài — dùng cho maxAttempts ở GET
+        // /api/get-exam-questions (theo roomCode). Tách riêng khỏi "results"
+        // vì "results" bị ghi đè theo doc id cố định "{examId}_{studentId}"
+        // nên không đếm được số lần làm thật nếu học sinh nộp lại nhiều lần.
+        await dbAdmin.collection('exam_attempts').doc(`${exam_id}_${studentId}`).set({
+            examId: exam_id,
+            studentId,
+            count: FieldValue.increment(1),
+            lastSubmittedAt: FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        // 7. Trả JSON về client — CHỈ lộ Điểm/Đáp án đúng/Lời giải nếu giáo
+        //    viên đã bật cờ tương ứng trong examData. Dữ liệu đầy đủ (details ở
+        //    trên) vẫn luôn được lưu full vào "results" bất kể cờ này; ở đây chỉ
+        //    lọc bớt những gì gửi ra NGOÀI ngay lúc nộp bài.
+        const responsePayload = { ok: true };
+
+        if (examData.showScoreImmediately === true) {
+            responsePayload.score = score;
+            responsePayload.correctCount = correctCount;
+            responsePayload.totalQuestions = totalQuestions;
+        }
+
+        if (examData.showCorrectAnswers === true || examData.showExplanation === true) {
+            responsePayload.details = details.map((item) => {
+                const filtered = {
+                    questionId: item.questionId,
+                    studentAnswer: item.studentAnswer,
+                    isCorrect: item.isCorrect
+                };
+                if (examData.showCorrectAnswers === true) {
+                    filtered.correctAnswer = item.correctAnswer;
+                }
+                if (examData.showExplanation === true) {
+                    filtered.explanation = item.explanation;
+                }
+                return filtered;
+            });
+        }
+
+        return res.json(responsePayload);
     } catch (error) {
         console.error('Lỗi chấm điểm / nộp bài:', error);
         return res.status(500).json({ message: 'Lỗi server khi nộp bài. Vui lòng thử lại.' });
