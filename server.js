@@ -243,6 +243,57 @@ async function loadExamForStudentByRoomCode(roomCode, studentId) {
 }
 
 /**
+ * --- (Phase 2 — Task 3) CHỐNG GIAN LẬN THỜI GIAN: ghi nhận / đọc lại mốc
+ * bắt đầu làm bài THẬT trên server ---
+ *
+ * Trước đây server hoàn toàn TIN TƯỞNG giá trị "timeUsed" (giây) do client
+ * (lam_bai.js) tự tính rồi gửi kèm lúc /api/submit-exam — học sinh chỉ cần
+ * sửa biến này trong DevTools trước khi gọi API là có thể "làm bài không
+ * giới hạn thời gian" mà vẫn được server ghi nhận như nộp đúng giờ.
+ *
+ * Bản vá: mỗi khi học sinh gọi GET /api/get-exam-questions (tức là THỰC SỰ
+ * bắt đầu vào phòng thi), server ghi 1 mốc "startedAt" (epoch ms) vào
+ * collection RIÊNG "exam_sessions", doc id "{examId}_{studentId}" — dùng
+ * Admin SDK nên học sinh không thể tự sửa/xoá qua Firestore Rules.
+ *
+ * QUAN TRỌNG: nếu session đã tồn tại từ trước (học sinh F5 lại trang giữa
+ * chừng, hoặc gọi lại API vì mất mạng), KHÔNG ghi đè startedAt — giữ
+ * nguyên mốc bắt đầu GỐC. Nếu ghi đè mỗi lần gọi, học sinh chỉ cần F5 liên
+ * tục là "reset" được đồng hồ thật trên server, quay lại y hệt lỗ hổng cũ.
+ * Đây cũng chính là mốc mà lam_bai.js dùng để tính lại endTimeTimestamp khi
+ * khôi phục tiến trình từ localStorage (Task 2) — 2 cơ chế cùng phối hợp:
+ * client autosave để KHÔNG MẤT bài, server startedAt để KHÔNG GIAN LẬN được
+ * thời gian, 2 việc độc lập nhau.
+ *
+ * Trả về startedAtMs (number, epoch millisecond) — luôn là mốc THẬT đầu
+ * tiên học sinh vào phòng thi này, bất kể gọi hàm này bao nhiêu lần.
+ */
+async function getOrStartExamSession(examId, studentId, examData) {
+    const sessionRef = dbAdmin.collection('exam_sessions').doc(`${examId}_${studentId}`);
+    const sessionSnap = await sessionRef.get();
+
+    if (sessionSnap.exists && typeof sessionSnap.data().startedAtMs === 'number') {
+        return sessionSnap.data().startedAtMs;
+    }
+
+    const startedAtMs = Date.now();
+    // set({...}, {merge:true}) thay vì tạo mới hoàn toàn: an toàn nếu 2
+    // request GET /api/get-exam-questions chạy gần như đồng thời (double
+    // click / mạng chập chờn gọi lại) — dù có ghi đè vài ms cũng chỉ lệch
+    // không đáng kể, không tạo ra 2 document khác nhau cho cùng 1 lượt thi.
+    await sessionRef.set({
+        examId,
+        studentId,
+        startedAtMs,
+        startedAt: FieldValue.serverTimestamp(),
+        duration: Number(examData.duration) > 0 ? Number(examData.duration) : 15,
+        unlimitedTime: examData.unlimitedTime === true
+    }, { merge: true });
+
+    return startedAtMs;
+}
+
+/**
  * Xáo mảng theo Fisher-Yates, dùng PRNG (mulberry32) được seed bằng 1 chuỗi
  * cố định (examId + studentId) -> luôn ra CÙNG 1 thứ tự cho cùng 1 học sinh
  * + cùng 1 bài thi, kể cả khi họ reload lại trang giữa chừng (tránh đổi thứ
@@ -323,6 +374,12 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
             return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
         }
 
+        // 3b. (Phase 2 — Task 3) Ghi nhận / đọc lại mốc BẮT ĐẦU làm bài thật
+        //     trên server — xem chi tiết đầy đủ ở getOrStartExamSession()
+        //     phía trên. Đây là nguồn THẬT DUY NHẤT để đối chiếu thời gian
+        //     lúc /api/submit-exam, không tin "timeUsed" client tự gửi.
+        const startedAtMs = await getOrStartExamSession(examId, studentId, examData);
+
         // 4. Lấy nội dung câu hỏi thật (chia chunk 10, dùng chung fetchQuestionsByIds).
         let orderedQuestions = await fetchQuestionsByIds(questionIds);
 
@@ -333,6 +390,12 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
 
         // 5. SANITIZE — bước quan trọng nhất: xoá sạch mọi trường chứa đáp án
         //    đúng trước khi trả JSON (xem ghi chú đầy đủ ở bản POST bên dưới).
+        //    ĐỒNG THỜI (Phase 2 — Task 3): đảm bảo trường "image" (link ảnh
+        //    Cloudinary của câu hỏi, nếu có) LUÔN được trả xuống client —
+        //    spread { ...q } vốn đã giữ nguyên "image", nhưng khai báo
+        //    tường minh ở đây để không ai vô tình xoá nhầm field này khi
+        //    sửa logic sanitize sau này (điểm dễ quên nhất mỗi khi thêm bớt
+        //    field mới trong "questions").
         const sanitizedQuestions = orderedQuestions.map((q) => {
             const clean = { ...q };
 
@@ -347,6 +410,10 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
             delete clean.correctAnswer;
             delete clean.essayAnswer;
 
+            // Đảm bảo luôn có field "image" (chuỗi rỗng nếu câu hỏi không có
+            // ảnh) để Frontend (lam_bai.js) không cần tự kiểm tra undefined.
+            clean.image = typeof q.image === 'string' ? q.image : '';
+
             return clean;
         });
 
@@ -356,6 +423,11 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
             duration: examData.duration || 15,
             allowSkip: examData.allowSkip !== false,
             allowFlagForReview: examData.allowFlagForReview === true,
+            // Trả kèm mốc bắt đầu THẬT (ms) — không bắt buộc lam_bai.js phải
+            // dùng giá trị này (client vẫn tự tính endTimeTimestamp để hiển
+            // thị đồng hồ mượt), nhưng hữu ích nếu sau này cần debug lệch
+            // giờ giữa client/server.
+            startedAt: startedAtMs,
             questions: sanitizedQuestions
         });
     } catch (error) {
@@ -492,6 +564,47 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
         }
 
+        // 2b. (Phase 2 — Task 3) CHỐNG GIAN LẬN THỜI GIAN — không tin tưởng
+        // tuyệt đối "timeUsed" do client tự tính rồi gửi lên nữa. Đối chiếu
+        // với "startedAt" đã ghi nhận THẬT trên server lúc học sinh gọi GET
+        // /api/get-exam-questions (xem getOrStartExamSession() phía trên).
+        //
+        //   - Không có session (học sinh gọi thẳng /api/submit-exam mà chưa
+        //     từng gọi get-exam-questions cho đúng bài này) -> KHÔNG có căn
+        //     cứ nào để tin đây là 1 lượt làm bài hợp lệ -> từ chối luôn.
+        //   - Có session -> tính serverElapsedSeconds = (thời điểm nộp) -
+        //     (thời điểm bắt đầu THẬT). So với thời lượng cấu hình
+        //     (examData.duration, phút) CỘNG THÊM dung sai 2 phút (network
+        //     lag, độ trễ gọi API...). Nếu bài KHÔNG giới hạn thời gian
+        //     (examData.unlimitedTime === true) thì bỏ qua bước so sánh này.
+        //   - Vượt quá dung sai -> KHÔNG chặn đứng việc nộp bài (học sinh có
+        //     thể đã làm xong thật, chỉ là mạng chậm/máy đơ) nhưng ĐÁNH DẤU
+        //     bài nộp là "nộp trễ / đáng ngờ" (lateSubmission = true) thay
+        //     vì âm thầm tin timeUsed do client gửi — giáo viên xem kết quả
+        //     sẽ thấy rõ cờ này để tự quyết định có huỷ bài hay không.
+        //   - timeUsedSeconds LƯU VÀO "results" LUÔN LÀ GIÁ TRỊ SERVER TỰ
+        //     TÍNH (serverElapsedSeconds), KHÔNG dùng "timeUsed" client gửi
+        //     làm nguồn chính nữa — giá trị client gửi chỉ lưu kèm riêng để
+        //     đối chiếu/debug (xem payload.clientReportedTimeUsedSeconds).
+        const sessionSnap = await dbAdmin.collection('exam_sessions').doc(`${exam_id}_${studentId}`).get();
+        if (!sessionSnap.exists || typeof sessionSnap.data().startedAtMs !== 'number') {
+            return res.status(400).json({
+                message: 'Không tìm thấy phiên làm bài hợp lệ. Vui lòng vào lại phòng thi từ đầu.'
+            });
+        }
+        const sessionData = sessionSnap.data();
+        const startedAtMs = sessionData.startedAtMs;
+        const serverElapsedSeconds = Math.max(0, Math.round((Date.now() - startedAtMs) / 1000));
+
+        const isUnlimitedTime = examData.unlimitedTime === true;
+        const allowedDurationSeconds = (Number(examData.duration) > 0 ? Number(examData.duration) : 15) * 60;
+        const TOLERANCE_SECONDS = 120; // dung sai 2 phút do độ trễ mạng
+        const isLateSubmission = !isUnlimitedTime && serverElapsedSeconds > (allowedDurationSeconds + TOLERANCE_SECONDS);
+
+        if (isLateSubmission) {
+            console.warn(`Nộp bài trễ hơn dung sai cho phép: exam=${exam_id}, student=${studentId}, serverElapsedSeconds=${serverElapsedSeconds}, allowedDurationSeconds=${allowedDurationSeconds}`);
+        }
+
         // 3. Lấy nội dung câu hỏi thật (chia chunk 10 vì toán tử "in" giới hạn 10-30
         //    phần tử tuỳ phiên bản; giữ 10 cho an toàn, khớp cách hocsinh.js đang làm)
         const questions = await fetchQuestionsByIds(questionIds);
@@ -582,11 +695,27 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             details,
             cheatWarnings: Number(cheatWarnings) || 0,
             cheatLogs: Array.isArray(cheatLogs) ? cheatLogs : [],
-            timeUsedSeconds: Number(timeUsed) || 0,
+            // (Phase 2 — Task 3) Nguồn SỰ THẬT DUY NHẤT cho thời gian làm
+            // bài giờ là serverElapsedSeconds (tính từ startedAt ghi nhận
+            // trên server), không còn dùng thẳng "timeUsed" client gửi lên
+            // nữa. clientReportedTimeUsedSeconds vẫn giữ lại để đối chiếu/
+            // debug khi cần điều tra chênh lệch bất thường.
+            timeUsedSeconds: serverElapsedSeconds,
+            clientReportedTimeUsedSeconds: Number(timeUsed) || 0,
+            lateSubmission: isLateSubmission,
             submitTime: FieldValue.serverTimestamp()
         };
 
         await dbAdmin.collection('results').doc(`${exam_id}_${studentId}`).set(payload);
+
+        // (Phase 2 — Task 3) Dọn session sau khi đã chấm điểm xong — lượt
+        // thi này coi như đã kết thúc; nếu maxAttempts cho phép làm lại,
+        // lần GET /api/get-exam-questions tiếp theo sẽ tạo session MỚI với
+        // startedAt MỚI (đúng ý nghĩa "bắt đầu lại từ đầu"), không bị dính
+        // startedAt của lượt cũ khiến lượt mới bị tính nộp trễ ngay lập tức.
+        await dbAdmin.collection('exam_sessions').doc(`${exam_id}_${studentId}`).delete().catch((cleanupErr) => {
+            console.error('Không xoá được exam_sessions sau khi nộp bài (không chặn kết quả đã lưu):', cleanupErr.message);
+        });
 
         // Cộng dồn số lần đã làm bài — dùng cho maxAttempts ở GET
         // /api/get-exam-questions (theo roomCode). Tách riêng khỏi "results"
