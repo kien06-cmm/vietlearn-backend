@@ -967,6 +967,11 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
     }
 });
 
+// Health check: để frontend/AI "đánh thức" server (tránh cold start ~12s)
+app.get('/api/health', (req, res) => {
+    return res.status(200).json({ status: 'ok', message: 'Server is running' });
+});
+
 // Lệnh này bắt buộc phải có để server không bị "thoát sớm"
 app.listen(PORT, () => {
     console.log(`Server đang chạy tại port ${PORT}`);
