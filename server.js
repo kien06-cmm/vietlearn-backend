@@ -180,6 +180,26 @@ async function loadExamForStudent(examId, studentId) {
 }
 
 /**
+ * Tên lớp THẬT lấy từ classes/{classId}.className (Admin SDK).
+ * Từ bước 3.2, exams.class_id là ID lớp thật (chính là mã tham gia lớp, vd "AB12CD"),
+ * không còn là chữ tự nhập như "9A1" nữa — nếu cứ tin className client gửi kèm
+ * (lam_bai.js dùng class_id làm dự phòng) thì results.className sẽ hiện ra mã lớp.
+ * Lỗi ở đây KHÔNG được chặn việc nộp bài -> trả null để nơi gọi tự dùng giá trị dự phòng.
+ */
+async function loadClassNameById(classId) {
+    if (!classId || typeof classId !== 'string') return null;
+    try {
+        const classSnap = await dbAdmin.collection('classes').doc(classId).get();
+        if (!classSnap.exists) return null;
+        const name = classSnap.data().className;
+        return (typeof name === 'string' && name.trim()) ? name.trim() : null;
+    } catch (classErr) {
+        console.error('Không lấy được tên lớp (không chặn việc chấm điểm):', classErr.message);
+        return null;
+    }
+}
+
+/**
  * Lấy nội dung câu hỏi thật theo danh sách ID, chia chunk 10 vì toán tử
  * Firestore "in" giới hạn tối đa 10 giá trị/lần truy vấn. Giữ đúng thứ tự
  * questionIds ban đầu; bỏ qua câu hỏi đã bị xoá khỏi ngân hàng.
@@ -842,6 +862,9 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             studentName = clientStudentName.trim();
         }
 
+        // 5b. Tên lớp thật từ collection "classes" (xem loadClassNameById()).
+        const serverClassName = await loadClassNameById(examData.class_id);
+
         // 6. Ghi kết quả bằng Admin SDK — bypass Firestore Rules hoàn toàn,
         //    nên rule results.create/update phía client có bị khoá (if false)
         //    cũng không ảnh hưởng gì tới việc ghi này.
@@ -851,11 +874,18 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             student_id: studentId,
             studentName,
             class_id: examData.class_id || '',
-            // FIX (mục 1.3 báo cáo): examData không có sẵn tên lớp (chỉ có
-            // class_id), nên className CHỈ có thể lấy từ giá trị client gửi
-            // kèm lúc nộp bài. Đây là field hiển thị (không ảnh hưởng điểm số),
-            // nên chấp nhận dùng trực tiếp giá trị từ req.body.
-            className: (typeof className === 'string' && className.trim()) ? className.trim() : 'Không xác định',
+            // BƯỚC 3.4 — DENORMALIZE SỔ ĐIỂM: chép thẳng từ exam (nguồn thật ở server,
+            // KHÔNG lấy từ req.body) vào "results" để bảng Sổ điểm ở quan-ly-lop.js
+            // gom điểm theo cột chỉ với 1 query trên "results", không phải join "exams".
+            // Exam cũ (tạo trước bước 3.2) chưa có 2 field này -> ghi '' và Sổ điểm sẽ bỏ qua.
+            gradebookColumnId: examData.gradebookColumnId || '',
+            gradebookColumnName: examData.gradebookColumnName || '',
+            // Bài đã nộp và được chấm xong. Sổ điểm CHỈ tính các bài có status này.
+            status: 'submitted',
+            // className: ưu tiên tên lớp THẬT tra từ "classes" (serverClassName). Giá trị
+            // client gửi kèm chỉ là dự phòng khi không tra được (field hiển thị, không ảnh hưởng điểm số).
+            className: serverClassName
+                || ((typeof className === 'string' && className.trim()) ? className.trim() : 'Không xác định'),
             subject: examData.subject || (typeof clientSubject === 'string' ? clientSubject : ''),
             // FIX kèm theo: exam dùng field "quizName" (không phải "title") —
             // xem mục 1.1 báo cáo. Đọc đúng field thật để không ghi results rỗng.
