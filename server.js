@@ -409,6 +409,7 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
 
             delete clean.correctAnswer;
             delete clean.essayAnswer;
+            delete clean.explanation; // lời giải chỉ được lộ SAU khi nộp bài (xem /api/get-review-material)
 
             // Đảm bảo luôn có field "image" (chuỗi rỗng nếu câu hỏi không có
             // ảnh) để Frontend (lam_bai.js) không cần tự kiểm tra undefined.
@@ -456,10 +457,11 @@ app.post('/api/extract-questions', async (req, res) => {
     "difficulty": "easy" | "medium" | "hard",
     "score": 1,
     "answers": [{"text": "Đáp án A", "correct": true}, {"text": "Đáp án B", "correct": false}] (Dùng cho trắc nghiệm),
-    "essayAnswer": "Đáp án tự luận mẫu" (Dùng cho tự luận)
+    "essayAnswer": "Đáp án tự luận mẫu" (Dùng cho tự luận),
+    "explanation": "Lời giải chi tiết CÓ SẴN trong tài liệu. Nếu tài liệu không có lời giải thì để chuỗi rỗng \"\", TUYỆT ĐỐI không tự bịa lời giải."
   }
 ]
-TUYỆT ĐỐI CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG KÝ HIỆU MARKDOWN HAY GIẢI THÍCH.`
+TUYỆT ĐỐI CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG KÝ HIỆU MARKDOWN VÀ KHÔNG THÊM VĂN BẢN NÀO BÊN NGOÀI MẢNG JSON.`
         });
 
         let promptText = "";
@@ -757,6 +759,21 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             });
         }
 
+        // 8. Cờ hiển thị nút "Tải file ôn tập" ở màn kết quả. Kiểm tra lại
+        //    bằng CHÍNH hàm mà /api/get-review-material dùng (checkReviewDownloadAccess)
+        //    để nút hiện <=> tải được. Lỗi ở bước này KHÔNG được làm hỏng việc
+        //    nộp bài (điểm đã ghi xong ở trên) -> bọc try/catch riêng.
+        try {
+            const reviewAccess = await checkReviewDownloadAccess(exam_id, examData, studentId);
+            responsePayload.allowDownloadReview = reviewAccess.ok;
+            if (!reviewAccess.ok && reviewAccess.locked) {
+                responsePayload.downloadReviewNote = reviewAccess.message;
+            }
+        } catch (reviewErr) {
+            console.error('Không kiểm tra được quyền tải file ôn tập (không chặn việc nộp bài):', reviewErr.message);
+            responsePayload.allowDownloadReview = false;
+        }
+
         return res.json(responsePayload);
     } catch (error) {
         console.error('Lỗi chấm điểm / nộp bài:', error);
@@ -824,6 +841,7 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
 
             delete clean.correctAnswer; // schema cũ (options[] + correctAnswer)
             delete clean.essayAnswer;   // đáp án mẫu tự luận
+            delete clean.explanation;   // lời giải chỉ lộ sau khi nộp bài
 
             return clean;
         });
@@ -967,7 +985,135 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// Health check: để frontend/AI "đánh thức" server (tránh cold start ~12s)
+/**
+ * --- (Tính năng mới) FILE ÔN TẬP SAU KHI NỘP BÀI ---
+ *
+ * Học sinh nộp bài xong có thể tải về trọn bộ đề thi kèm đáp án đúng + lời
+ * giải (PDF/Word) để ôn tập offline. Quyền tải do GIÁO VIÊN quyết định lúc
+ * tạo bài (field exams.allowDownloadReview, xem tao-bai-kiem-tra.js).
+ *
+ * Vì collection "questions" đã khoá quyền đọc của học sinh (chỉ giáo viên
+ * sở hữu đọc được), dữ liệu đề + đáp án PHẢI đi qua server (Admin SDK). Mọi
+ * điều kiện dưới đây đều kiểm ở server, không tin bất cứ gì client gửi:
+ *
+ *   1. Giáo viên đã bật allowDownloadReview cho bài này.
+ *   2. Nhất quán với các cờ hiển thị sẵn có, theo thứ tự lồng nhau giống
+ *      /api/get-result-detail: phải bật showScoreImmediately VÀ
+ *      showCorrectAnswers (file này chứa đáp án đúng, không thể "mở cửa
+ *      sau" trong khi giáo viên đang tắt hiện đáp án). Lời giải chỉ kèm
+ *      theo nếu giáo viên bật showExplanation.
+ *   3. Học sinh ĐÃ NỘP BÀI: tồn tại results/{exam_id}_{uid}.
+ *   4. Nếu bài cho làm nhiều lần (maxAttempts > 1) thì chỉ mở khi học sinh
+ *      đã dùng HẾT lượt — nếu không, tải file đáp án xong là làm lại lần
+ *      sau được điểm cao dễ dàng.
+ *
+ * File xuất ra KHÔNG chứa điểm hay bài làm cá nhân — chỉ đề + đáp án + lời
+ * giải, theo đúng thứ tự giáo viên xếp câu hỏi (không xáo trộn).
+ */
+async function checkReviewDownloadAccess(examId, examData, studentId) {
+    if (examData.allowDownloadReview !== true) {
+        return { ok: false, status: 403, message: 'Giáo viên không bật tính năng tải file ôn tập cho bài kiểm tra này.' };
+    }
+    if (examData.showScoreImmediately !== true || examData.showCorrectAnswers !== true) {
+        return { ok: false, status: 403, message: 'Giáo viên chưa mở phần xem đáp án cho bài kiểm tra này.' };
+    }
+
+    const resultSnap = await dbAdmin.collection('results').doc(`${examId}_${studentId}`).get();
+    if (!resultSnap.exists || resultSnap.data().student_id !== studentId) {
+        return { ok: false, status: 403, message: 'Bạn cần nộp bài trước khi tải file ôn tập.' };
+    }
+
+    const maxAttempts = Number(examData.maxAttempts) > 1 ? Number(examData.maxAttempts) : null;
+    if (maxAttempts !== null) {
+        const attemptSnap = await dbAdmin.collection('exam_attempts').doc(`${examId}_${studentId}`).get();
+        const usedAttempts = attemptSnap.exists ? (Number(attemptSnap.data().count) || 0) : 0;
+        if (usedAttempts < maxAttempts) {
+            return {
+                ok: false,
+                locked: true,
+                status: 403,
+                message: `Bạn còn ${maxAttempts - usedAttempts} lượt làm bài. File ôn tập sẽ mở sau khi bạn dùng hết số lượt.`
+            };
+        }
+    }
+
+    return { ok: true };
+}
+
+/**
+ * Chuẩn hoá 1 câu hỏi về dạng gọn cho file ôn tập, hỗ trợ cả 2 schema
+ * (answers[{text,correct}] và options[]+correctAnswer) — cùng cách
+ * getCorrectIndexServer/getOptionTextsServer đang làm. Khác getCorrectIndexServer
+ * ở chỗ trả về MỌI đáp án đúng (câu "nhiều đáp án").
+ */
+function toReviewQuestionServer(q, includeExplanation) {
+    const type = typeof q.type === 'string' ? q.type : 'multiple_choice';
+
+    let correctIndexes = [];
+    if (Array.isArray(q.answers)) {
+        q.answers.forEach((a, i) => { if (a && a.correct === true) correctIndexes.push(i); });
+    } else if (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0) {
+        correctIndexes = [q.correctAnswer];
+    }
+
+    return {
+        id: q.id,
+        type,
+        text: q.question || q.text || '',
+        options: type === 'essay' ? [] : getOptionTextsServer(q),
+        correctIndexes,
+        essayAnswer: (type === 'essay' && typeof q.essayAnswer === 'string') ? q.essayAnswer : '',
+        explanation: (includeExplanation && typeof q.explanation === 'string') ? q.explanation : '',
+        image: typeof q.image === 'string' ? q.image : '',
+        score: Number(q.score) > 0 ? Number(q.score) : 1
+    };
+}
+
+app.post('/api/get-review-material', verifyFirebaseToken, async (req, res) => {
+    try {
+        const studentId = req.uid; // từ token đã xác thực, không tin body
+        const { exam_id } = req.body || {};
+
+        if (!exam_id || typeof exam_id !== 'string' || exam_id.includes('/')) {
+            return res.status(400).json({ message: 'Thiếu hoặc sai exam_id.' });
+        }
+
+        const examSnap = await dbAdmin.collection('exams').doc(exam_id).get();
+        if (!examSnap.exists) {
+            return res.status(404).json({ message: 'Không tìm thấy bài kiểm tra.' });
+        }
+        const examData = examSnap.data();
+
+        const access = await checkReviewDownloadAccess(exam_id, examData, studentId);
+        if (!access.ok) {
+            return res.status(access.status).json({ message: access.message });
+        }
+
+        const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
+        if (questionIds.length === 0) {
+            return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
+        }
+
+        const includeExplanation = examData.showExplanation === true;
+        const questions = await fetchQuestionsByIds(questionIds);
+
+        // Dữ liệu chứa đáp án -> tuyệt đối không cho trình duyệt/proxy cache lại.
+        res.set('Cache-Control', 'no-store');
+        return res.json({
+            ok: true,
+            title: examData.quizName || examData.title || 'Bài kiểm tra',
+            subject: examData.subject || '',
+            includeExplanation,
+            questions: questions.map((q) => toReviewQuestionServer(q, includeExplanation))
+        });
+    } catch (error) {
+        console.error('Lỗi lấy dữ liệu file ôn tập:', error);
+        return res.status(500).json({ message: 'Lỗi server khi tạo file ôn tập.' });
+    }
+});
+
+// Health check: frontend (tailieu.js...) ping route này để "đánh thức" server
+// Render (free tier) và biết server đã sẵn sàng trước khi cho thao tác.
 app.get('/api/health', (req, res) => {
     return res.status(200).json({ status: 'ok', message: 'Server is running' });
 });
