@@ -437,40 +437,194 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
     }
 });
 
+/**
+ * Xoá mọi trường chứa đáp án đúng khỏi 1 câu hỏi trước khi gửi xuống client
+ * (cùng logic với bước SANITIZE của GET /api/get-exam-questions ở trên).
+ */
+function sanitizeQuestionForClient(q) {
+    const clean = { ...q };
+
+    if (Array.isArray(clean.answers)) {
+        clean.answers = clean.answers.map((ans) => {
+            if (!ans || typeof ans !== 'object') return ans;
+            const { correct, ...rest } = ans;
+            return rest;
+        });
+    }
+
+    delete clean.correctAnswer;
+    delete clean.essayAnswer;
+    delete clean.explanation;
+    clean.image = typeof q.image === 'string' ? q.image : '';
+
+    return clean;
+}
+
+/**
+ * --- API THI THỬ của giáo viên (GET) ---
+ * Dùng cho nút [Thi thử]: lam_bai.html?exam_id=<id>&preview=1
+ *
+ * Khác /api/get-exam-questions (dành cho học sinh):
+ *   - Tra theo exam_id, KHÔNG cần roomCode, KHÔNG yêu cầu status == 'active'
+ *     (giáo viên thi thử được cả bài nháp).
+ *   - KHÔNG kiểm tra thành viên lớp; thay vào đó bắt buộc
+ *     examData.teacher_id === uid trong token -> chỉ chủ bài thi mới xem được.
+ *   - KHÔNG ghi "exam_sessions" / "exam_attempts" / "results": thi thử không
+ *     để lại dấu vết nào trong dữ liệu học sinh.
+ *   - Câu hỏi vẫn được sanitize (không lộ đáp án) để trải nghiệm giống học sinh.
+ */
+app.get('/api/preview-exam', verifyFirebaseToken, async (req, res) => {
+    try {
+        const examId = typeof req.query.exam_id === 'string' ? req.query.exam_id.trim() : '';
+        if (!examId) {
+            return res.status(400).json({ message: 'Thiếu exam_id.' });
+        }
+
+        const examSnap = await dbAdmin.collection('exams').doc(examId).get();
+        if (!examSnap.exists) {
+            return res.status(404).json({ message: 'Không tìm thấy bài kiểm tra.' });
+        }
+        const examData = examSnap.data();
+
+        if (examData.teacher_id !== req.uid) {
+            return res.status(403).json({ message: 'Chỉ giáo viên tạo bài kiểm tra này mới được thi thử.' });
+        }
+
+        const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
+        if (questionIds.length === 0) {
+            return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
+        }
+
+        let orderedQuestions = await fetchQuestionsByIds(questionIds);
+        if (examData.shuffleQuestions === true) {
+            orderedQuestions = seededShuffle(orderedQuestions, `${examId}_${req.uid}`);
+        }
+
+        return res.json({
+            examId,
+            preview: true,
+            title: examData.quizName || examData.title || '',
+            subject: examData.subject || '',
+            duration: examData.duration || 15,
+            allowSkip: examData.allowSkip !== false,
+            allowFlagForReview: examData.allowFlagForReview === true,
+            questions: orderedQuestions.map(sanitizeQuestionForClient)
+        });
+    } catch (error) {
+        console.error('Lỗi thi thử bài kiểm tra:', error);
+        return res.status(500).json({ message: 'Lỗi server khi tải bài thi thử.' });
+    }
+});
+
 // --- API Xử lý Bóc tách tài liệu (PDF/Word/Forms) ---
+//
+// CHỐNG "BỊA" CÂU HỎI (hallucination) — 4 lớp:
+//   1. System prompt: AI chỉ là công cụ TRÍCH XUẤT, cấm sáng tác, không có
+//      câu hỏi thì trả [].
+//   2. temperature: 0 + responseMimeType JSON: bớt "sáng tạo", output đúng cấu trúc.
+//   3. Google Forms: Gemini KHÔNG mở được URL. Bản cũ chỉ đưa cho nó cái link
+//      -> nó tự bịa câu hỏi cho có. Nay server tự tải form, đưa DỮ LIỆU THẬT
+//      của form cho AI trích xuất.
+//   4. Kiểm tra lại output: bỏ mọi câu hỏi sai cấu trúc trước khi trả về.
+const EXTRACT_SYSTEM_PROMPT = `Bạn LÀ công cụ trích xuất dữ liệu, KHÔNG phải người soạn đề.
+Nhiệm vụ: CHỈ ĐƯỢC trích xuất những câu hỏi CÓ SẴN trong tài liệu được cung cấp.
+
+QUY TẮC BẮT BUỘC:
+1. TUYỆT ĐỐI KHÔNG tự sáng tác, suy luận hay thêm bớt câu hỏi, đáp án hoặc lời giải. Không viết thêm câu hỏi cho "đủ số lượng", không dùng kiến thức bên ngoài tài liệu.
+2. Nếu tài liệu không chứa câu hỏi nào (trắc nghiệm, đúng/sai hoặc tự luận), trả về mảng rỗng [].
+3. Giữ nguyên văn câu hỏi và từng đáp án như trong tài liệu. Không diễn đạt lại, không sửa số liệu.
+4. Đáp án đúng: CHỈ đặt "correct": true khi tài liệu CHỈ RÕ đáp án đúng (đáp án cuối bài, in đậm, gạch chân, dấu đánh dấu). Nếu tài liệu không chỉ rõ, đặt "correct": false cho TẤT CẢ đáp án. TUYỆT ĐỐI KHÔNG tự giải bài để chọn đáp án đúng.
+5. "explanation": chỉ lấy lời giải CÓ SẴN trong tài liệu; không có thì để chuỗi rỗng "".
+6. "subject" và "grade": chỉ điền khi tài liệu ghi rõ; không có thì để chuỗi rỗng "". "difficulty": nếu tài liệu không ghi thì dùng "medium".
+7. Công thức toán giữ ở dạng LaTeX: dùng \\( ... \\) cho công thức trong dòng và $$ ... $$ cho công thức riêng dòng.
+
+Trả về MỘT MẢNG JSON duy nhất theo đúng định dạng:
+[
+  {
+    "question": "Nội dung câu hỏi",
+    "type": "multiple_choice" | "essay" | "true_false",
+    "subject": "Tên môn học (chuỗi rỗng nếu tài liệu không ghi)",
+    "grade": "Khối lớp (chuỗi rỗng nếu tài liệu không ghi)",
+    "difficulty": "easy" | "medium" | "hard",
+    "score": 1,
+    "answers": [{"text": "Đáp án A", "correct": false}, {"text": "Đáp án B", "correct": false}] (Dùng cho trắc nghiệm),
+    "essayAnswer": "Đáp án tự luận mẫu CÓ SẴN trong tài liệu (nếu có)" (Dùng cho tự luận),
+    "explanation": "Lời giải có sẵn trong tài liệu (chuỗi rỗng nếu không có)"
+  }
+]
+CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG MARKDOWN VÀ KHÔNG THÊM VĂN BẢN NÀO NGOÀI MẢNG JSON.`;
+
+const EXTRACT_VALID_TYPES = ['multiple_choice', 'essay', 'true_false'];
+
+/** Bỏ mọi phần tử không đúng cấu trúc (thiếu nội dung, sai type, trắc nghiệm thiếu đáp án). */
+function sanitizeExtractedQuestions(raw) {
+    if (!Array.isArray(raw)) return [];
+
+    return raw.filter((q) => {
+        if (!q || typeof q.question !== 'string' || q.question.trim() === '') return false;
+        if (!EXTRACT_VALID_TYPES.includes(q.type)) return false;
+
+        if (q.type === 'multiple_choice') {
+            return Array.isArray(q.answers)
+                && q.answers.length >= 2
+                && q.answers.every((a) => a && typeof a.text === 'string' && a.text.trim() !== '');
+        }
+        return true;
+    });
+}
+
+/**
+ * Tải dữ liệu THẬT của 1 Google Form công khai (biến FB_PUBLIC_LOAD_DATA_ nhúng
+ * trong trang viewform). Chỉ cho phép docs.google.com/forms và forms.gle để
+ * tránh bị lợi dụng làm proxy gọi URL bất kỳ (SSRF). Cần Node 18+ (fetch có sẵn).
+ * Lưu ý: trang công khai của Google Forms KHÔNG chứa đáp án đúng.
+ */
+async function fetchGoogleFormsData(formsUrl) {
+    let url;
+    try {
+        url = new URL(formsUrl);
+    } catch (e) {
+        throw new Error('Link Google Forms không hợp lệ.');
+    }
+
+    const isAllowedHost =
+        (url.hostname === 'docs.google.com' && url.pathname.startsWith('/forms/')) ||
+        url.hostname === 'forms.gle';
+    if (url.protocol !== 'https:' || !isAllowedHost) {
+        throw new Error('Link Google Forms không hợp lệ.');
+    }
+
+    const response = await fetch(url.href, { redirect: 'follow' });
+    if (!response.ok) {
+        throw new Error('Không mở được Google Forms. Hãy đặt form ở chế độ "Bất kỳ ai có đường liên kết".');
+    }
+
+    const html = await response.text();
+    const match = html.match(/FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);\s*<\/script>/);
+    if (!match) {
+        throw new Error('Không đọc được nội dung form (form yêu cầu đăng nhập hoặc không công khai).');
+    }
+
+    return match[1].slice(0, 200000);
+}
+
 app.post('/api/extract-questions', async (req, res) => {
     try {
         const { source, mimeType, fileBase64, formsUrl } = req.body;
         console.log("Đã nhận yêu cầu xử lý từ frontend:", source);
 
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        // Sử dụng model Gemini 3.5 Flash Lite siêu tốc
         const model = genAI.getGenerativeModel({
             model: "gemini-3.5-flash-lite",
-            systemInstruction: `Bạn là trợ lý AI chuyên phân tích tài liệu giáo dục. Nhiệm vụ của bạn là bóc tách các câu hỏi trong tài liệu và trả về MỘT MẢNG JSON duy nhất chứa các câu hỏi theo đúng định dạng sau:
-[
-  {
-    "question": "Nội dung câu hỏi",
-    "type": "multiple_choice" | "essay" | "true_false",
-    "subject": "Tên môn học",
-    "grade": "Khối lớp (ví dụ: 10, 11, 12)",
-    "difficulty": "easy" | "medium" | "hard",
-    "score": 1,
-    "answers": [{"text": "Đáp án A", "correct": true}, {"text": "Đáp án B", "correct": false}] (Dùng cho trắc nghiệm),
-    "essayAnswer": "Đáp án tự luận mẫu" (Dùng cho tự luận),
-    "explanation": "Lời giải chi tiết CÓ SẴN trong tài liệu. Nếu tài liệu không có lời giải thì để chuỗi rỗng \"\", TUYỆT ĐỐI không tự bịa lời giải."
-  }
-]
-TUYỆT ĐỐI CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG KÝ HIỆU MARKDOWN VÀ KHÔNG THÊM VĂN BẢN NÀO BÊN NGOÀI MẢNG JSON.`
+            systemInstruction: EXTRACT_SYSTEM_PROMPT,
+            generationConfig: { temperature: 0, responseMimeType: 'application/json' }
         });
 
-        let promptText = "";
-        let requestContent = [];
+        let requestContent;
 
         if (source === 'file' && fileBase64) {
-            promptText = "Hãy bóc tách tất cả các câu hỏi có trong tài liệu đính kèm này.";
             requestContent = [
-                promptText,
+                "Trích xuất các câu hỏi CÓ SẴN trong tài liệu đính kèm. Nếu không có câu hỏi nào, trả về [].",
                 {
                     inlineData: {
                         data: fileBase64,
@@ -479,17 +633,37 @@ TUYỆT ĐỐI CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG KÝ HIỆU MARK
                 }
             ];
         } else if (source === 'google-forms' && formsUrl) {
-             promptText = `Hãy phân tích đường link Google Forms sau đây và bóc tách các câu hỏi: ${formsUrl}`;
-             requestContent = [promptText];
+            let formsData;
+            try {
+                formsData = await fetchGoogleFormsData(formsUrl);
+            } catch (formsError) {
+                return res.status(422).json({ message: formsError.message });
+            }
+            requestContent = [
+                "Dưới đây là dữ liệu thô (JSON) của một Google Form. CHỈ trích xuất các câu hỏi và lựa chọn có trong dữ liệu này. " +
+                "Google Forms không chứa đáp án đúng nên đặt \"correct\": false cho tất cả đáp án. Nếu không có câu hỏi nào, trả về [].\n\n" +
+                formsData
+            ];
         } else {
-             return res.status(400).json({ message: "Thiếu dữ liệu đầu vào (file hoặc link)." });
+            return res.status(400).json({ message: "Thiếu dữ liệu đầu vào (file hoặc link)." });
         }
 
         const result = await model.generateContent(requestContent);
-        let text = result.response.text().replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+        const text = result.response.text().replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+
+        let parsed;
+        try {
+            parsed = JSON.parse(text);
+        } catch (parseError) {
+            console.error("AI trả về JSON không hợp lệ:", text.slice(0, 300));
+            return res.status(422).json({ message: "AI trả về dữ liệu không hợp lệ. Vui lòng thử lại." });
+        }
+
+        // Chấp nhận cả mảng thuần lẫn { questions: [...] }, rồi lọc lại cho chắc.
+        const rawList = Array.isArray(parsed) ? parsed : parsed && parsed.questions;
 
         // Trả về đúng định dạng { questions: [...] } mà Frontend yêu cầu
-        res.json({ questions: JSON.parse(text) });
+        res.json({ questions: sanitizeExtractedQuestions(rawList) });
 
     } catch (error) {
         console.error("Lỗi bóc tách tài liệu:", error);
