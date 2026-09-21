@@ -148,6 +148,84 @@ function getOptionTextsServer(q) {
     return Array.isArray(q.options) ? q.options : [];
 }
 
+// ===== GIAI ĐOẠN 4.3 — BẮT ĐẦU: helper cho câu hỏi CHẤM TAY (tự luận / nộp file) =====
+
+/** Loại câu hỏi KHÔNG thể tự chấm, phải chờ giáo viên chấm (SpeedGrader). */
+const MANUAL_QUESTION_TYPES = ['essay', 'upload'];
+
+/** Giới hạn độ dài bài tự luận lưu vào results (document Firestore tối đa 1MB). */
+const MAX_ESSAY_LENGTH = 20000;
+
+function isManualQuestionServer(q) {
+    return !!q && MANUAL_QUESTION_TYPES.includes(q.type);
+}
+
+/**
+ * Chỉ chấp nhận file nằm trên Cloudinary (https). Học sinh không thể nhét link
+ * tuỳ ý (javascript:, trang lạ...) vào results.manualItems[].fileUrl để giáo
+ * viên bấm vào lúc chấm bài.
+ */
+function isAllowedUploadUrl(value) {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return false;
+    try {
+        const u = new URL(value.trim());
+        return u.protocol === 'https:'
+            && (u.hostname === 'res.cloudinary.com' || u.hostname.endsWith('.cloudinary.com'));
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Lấy câu trả lời của 1 câu chấm tay từ answers[questionId] học sinh gửi lên.
+ * Chấp nhận cả dạng chuỗi thuần lẫn object ({ text | essayAnswer | fileUrl | url }).
+ */
+function extractManualAnswerServer(q, rawAnswer) {
+    const asObject = (rawAnswer && typeof rawAnswer === 'object' && !Array.isArray(rawAnswer)) ? rawAnswer : null;
+
+    if (q.type === 'essay') {
+        const text = typeof rawAnswer === 'string'
+            ? rawAnswer
+            : (asObject ? (asObject.essayAnswer ?? asObject.text ?? asObject.answer) : '');
+        return { essayAnswer: typeof text === 'string' ? text.trim().slice(0, MAX_ESSAY_LENGTH) : '' };
+    }
+
+    // upload
+    const url = typeof rawAnswer === 'string'
+        ? rawAnswer
+        : (asObject ? (asObject.fileUrl ?? asObject.url) : '');
+    const cleanUrl = typeof url === 'string' ? url.trim() : '';
+    return {
+        fileUrl: isAllowedUploadUrl(cleanUrl) ? cleanUrl : '',
+        fileName: (asObject && typeof asObject.fileName === 'string') ? asObject.fileName.trim().slice(0, 200) : ''
+    };
+}
+
+/**
+ * "Làm lại bài": /api/submit-exam ghi results/{exam}_{student} bằng set() nên bản
+ * cũ (điểm, lời phê của giáo viên) bị ghi đè. Trước khi ghi đè, lưu bản cũ vào
+ * results/{id}/attempts/{submitTimeMs} để không mất dấu vết. Lỗi ở đây KHÔNG được
+ * chặn việc nộp bài -> chỉ log.
+ */
+async function archivePreviousResultAttempt(resultRef) {
+    try {
+        const prevSnap = await resultRef.get();
+        if (!prevSnap.exists) return;
+        const prev = prevSnap.data();
+        const prevMs = (prev.submitTime && typeof prev.submitTime.toMillis === 'function')
+            ? prev.submitTime.toMillis()
+            : Date.now();
+        await resultRef.collection('attempts').doc(String(prevMs)).set({
+            ...prev,
+            archivedAt: FieldValue.serverTimestamp()
+        });
+    } catch (archiveErr) {
+        console.error('Không lưu được bản nộp cũ (không chặn việc nộp bài):', archiveErr.message);
+    }
+}
+
+// ===== GIAI ĐOẠN 4.3 — KẾT THÚC: helper cho câu hỏi CHẤM TAY =====
+
 /**
  * Xác nhận học sinh (studentId) thực sự là thành viên active của lớp sở
  * hữu 1 bài kiểm tra cụ thể — dùng chung cho cả /api/submit-exam và
@@ -819,8 +897,22 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         // theo showCorrectAnswers/showExplanation CHỈ áp dụng lên response trả
         // về ngay lúc nộp bài (xem bước 7 bên dưới), không áp lên dữ liệu lưu.
         const details = [];
+        // GIAI ĐOẠN 4.3: các câu Tự luận / Upload file KHÔNG tự chấm được -> gom vào
+        // manualItems để giáo viên chấm ở SpeedGrader (quan-ly-ket-qua).
+        const manualItems = [];
 
         questions.forEach((q) => {
+            if (isManualQuestionServer(q)) {
+                manualItems.push({
+                    questionId: q.id,
+                    type: q.type,
+                    questionText: q.question || q.text || '',
+                    points: Number(q.score) > 0 ? Number(q.score) : 1,
+                    ...extractManualAnswerServer(q, safeAnswers[q.id])
+                });
+                return;
+            }
+
             const points = Number(q.score) > 0 ? Number(q.score) : 1;
             totalPoints += points;
 
@@ -844,7 +936,13 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         });
 
         const totalQuestions = questions.length;
-        const score = totalPoints > 0 ? Number(((earnedPoints / totalPoints) * 10).toFixed(1)) : 0;
+        // GIAI ĐOẠN 4.3: có câu chấm tay -> CHƯA có điểm chính thức (score = null,
+        // gradingStatus = 'pending') cho tới khi giáo viên chấm qua /api/grade-result.
+        // autoScore chỉ là điểm riêng của phần trắc nghiệm, để giáo viên tham khảo.
+        const hasManualItems = manualItems.length > 0;
+        const gradingStatus = hasManualItems ? 'pending' : 'graded';
+        const autoScore = totalPoints > 0 ? Number(((earnedPoints / totalPoints) * 10).toFixed(1)) : null;
+        const score = hasManualItems ? null : (autoScore !== null ? autoScore : 0);
 
         // 5. Lấy tên học sinh thật từ hồ sơ (không tin studentName client tự gửi
         //    làm nguồn CHÍNH — chỉ dùng làm dự phòng nếu hồ sơ không có tên).
@@ -881,7 +979,10 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             gradebookColumnId: examData.gradebookColumnId || '',
             gradebookColumnName: examData.gradebookColumnName || '',
             // Bài đã nộp và được chấm xong. Sổ điểm CHỈ tính các bài có status này.
-            status: 'submitted',
+            // GIAI ĐOẠN 4.3: bài còn phần chấm tay để 'pending_grading' -> Sổ điểm tự bỏ qua
+            // (không bị tính 0 điểm) cho tới khi giáo viên chấm xong, lúc đó
+            // /api/grade-result chuyển lại thành 'submitted'.
+            status: hasManualItems ? 'pending_grading' : 'submitted',
             // className: ưu tiên tên lớp THẬT tra từ "classes" (serverClassName). Giá trị
             // client gửi kèm chỉ là dự phòng khi không tra được (field hiển thị, không ảnh hưởng điểm số).
             className: serverClassName
@@ -891,6 +992,11 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             // xem mục 1.1 báo cáo. Đọc đúng field thật để không ghi results rỗng.
             quizName: examData.quizName || examData.title || (typeof clientQuizName === 'string' ? clientQuizName : ''),
             score,
+            // --- GIAI ĐOẠN 4.3: chấm bài thủ công ---
+            gradingStatus,                                   // 'pending' | 'graded'
+            autoScore: hasManualItems ? autoScore : null,    // điểm riêng phần trắc nghiệm (tham khảo)
+            manualItems,                                     // [{ questionId, type, questionText, points, essayAnswer | fileUrl }]
+            teacherFeedback: '',                             // làm lại bài -> xoá lời phê của lượt trước
             correctCount,
             totalQuestions,
             // FIX (mục 1.4 báo cáo): trước đây KHÔNG lưu đáp án học sinh đã
@@ -912,7 +1018,12 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             submitTime: FieldValue.serverTimestamp()
         };
 
-        await dbAdmin.collection('results').doc(`${exam_id}_${studentId}`).set(payload);
+        const resultRef = dbAdmin.collection('results').doc(`${exam_id}_${studentId}`);
+        // GIAI ĐOẠN 4.3: nộp lại -> lưu bản cũ (điểm + lời phê) vào results/{id}/attempts
+        // rồi mới ghi đè. set() KHÔNG merge nên điểm/lời phê/gradedAt cũ bị xoá sạch,
+        // bài mới luôn bắt đầu từ trạng thái pending (nếu có câu chấm tay).
+        await archivePreviousResultAttempt(resultRef);
+        await resultRef.set(payload);
 
         // (Phase 2 — Task 3) Dọn session sau khi đã chấm điểm xong — lượt
         // thi này coi như đã kết thúc; nếu maxAttempts cho phép làm lại,
@@ -938,9 +1049,10 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         //    viên đã bật cờ tương ứng trong examData. Dữ liệu đầy đủ (details ở
         //    trên) vẫn luôn được lưu full vào "results" bất kể cờ này; ở đây chỉ
         //    lọc bớt những gì gửi ra NGOÀI ngay lúc nộp bài.
-        const responsePayload = { ok: true };
+        const responsePayload = { ok: true, gradingStatus };
 
         if (examData.showScoreImmediately === true) {
+            // score = null khi bài đang chờ chấm -> Frontend phải hiện "Chờ chấm", không toFixed().
             responsePayload.score = score;
             responsePayload.correctCount = correctCount;
             responsePayload.totalQuestions = totalQuestions;
@@ -1130,7 +1242,9 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
         const skippedCount = fullDetails.filter(
             (d) => d.studentAnswer === null || d.studentAnswer === undefined
         ).length;
-        const incorrectCount = Math.max(0, totalQuestions - correctCount - skippedCount);
+        // GIAI ĐOẠN 4.3: câu Tự luận / Upload không nằm trong details nên không được tính là "sai".
+        const manualCount = Array.isArray(resultData.manualItems) ? resultData.manualItems.length : 0;
+        const incorrectCount = Math.max(0, totalQuestions - manualCount - correctCount - skippedCount);
 
         const responsePayload = {
             ok: true,
@@ -1143,11 +1257,16 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
                 : null,
             scoreVisible,
             questionsVisible,
-            explanationVisible
+            explanationVisible,
+            // GIAI ĐOẠN 4.3: 'pending' = còn phần chờ giáo viên chấm (score có thể là null)
+            gradingStatus: resultData.gradingStatus || 'graded'
         };
 
         if (scoreVisible) {
-            responsePayload.score = resultData.score;
+            responsePayload.score = (resultData.score === undefined) ? null : resultData.score;
+            if (typeof resultData.teacherFeedback === 'string' && resultData.teacherFeedback.trim() !== '') {
+                responsePayload.teacherFeedback = resultData.teacherFeedback;
+            }
             responsePayload.correctCount = correctCount;
             responsePayload.incorrectCount = incorrectCount;
             responsePayload.skippedCount = skippedCount;
@@ -1188,6 +1307,193 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ message: 'Lỗi server khi tải chi tiết bài làm.' });
     }
 });
+
+// ===== GIAI ĐOẠN 4.3 (SpeedGrader) + 4.4 (Miễn thi) — BẮT ĐẦU: API GIÁO VIÊN CHẤM BÀI / MIỄN THI =====
+/**
+ * --- API Giáo viên chấm điểm bài Tự luận / Upload file, hoặc cho học sinh Miễn thi ---
+ *
+ * Client (quan-ly-ket-qua.js -> submitGrade) gửi:
+ *   Header : Authorization: Bearer <Firebase ID token của GIÁO VIÊN>
+ *   Body   : {
+ *     result_id            : string        — id document trong collection "results" ("{exam_id}_{student_id}")
+ *     score                : number|null   — điểm CUỐI CÙNG của cả bài (0 -> maxScore, mặc định 10); null khi miễn thi
+ *     isExcused            : boolean       — true = Miễn thi (không tính điểm bài này)
+ *     teacherFeedback      : string        — lời phê, tối đa 2000 ký tự (có thể rỗng)
+ *     expectedSubmitTimeMs : number|null   — mốc nộp bài (ms) của bản giáo viên đang xem
+ *   }
+ * Lỗi trả về: JSON { ok:false, message, code } — client đọc `message` và `code`.
+ *
+ * KẾT QUẢ GHI VÀO results/{result_id}:
+ *   isExcused === true  -> status:'excused',   excused:true,  score:null,    gradingStatus:'graded'
+ *   isExcused === false -> status:'submitted', excused:false, score:<điểm>,  gradingStatus:'graded'
+ *   cả hai trường hợp   -> teacherFeedback, gradedAt (server time), gradedBy (uid giáo viên)
+ *
+ * Mã lỗi: 400 dữ liệu sai | 401 token sai/hết hạn | 403 không phải giáo viên chủ bài
+ *         | 404 không có bài làm | 409 học sinh vừa nộp lại bài lúc đang chấm.
+ *
+ * Bảo mật:
+ *   - CHỈ giáo viên sở hữu bài (results.teacher_id === uid trong token) mới chấm / miễn thi được.
+ *   - Điểm được kiểm tra lại ở server (số hữu hạn, trong [0, maxScore]).
+ *
+ * Chống ghi đè nhầm khi học sinh "làm lại bài" giữa lúc giáo viên đang chấm:
+ *   /api/submit-exam ghi đè results/{id} (submitTime mới). Nếu expectedSubmitTimeMs
+ *   không khớp submitTime hiện tại -> 409, KHÔNG ghi điểm của bản cũ lên bài mới.
+ *   Đọc + kiểm tra + ghi nằm trong 1 transaction nên không có khe hở giữa 2 bước.
+ *
+ * Lưu ý tích hợp: route này tự xác thực token bên trong (để trả đúng định dạng lỗi
+ * { ok:false, message, code }) nên KHÔNG dùng middleware verifyFirebaseToken —
+ * middleware đó vẫn giữ nguyên cho các route khác.
+ */
+const GRADE_FEEDBACK_MAX_CHARS = 2000;
+const GRADE_DEFAULT_MAX_SCORE = 10;
+
+/** Lỗi có mã HTTP, để ném từ trong transaction rồi trả JSON đúng định dạng client mong đợi. */
+class HttpError extends Error {
+    constructor(status, message, code) {
+        super(message);
+        this.status = status;
+        this.code = code || null;
+    }
+}
+
+/** Timestamp Firestore | Date | number (ms) -> số ms; không đọc được thì null. */
+function toMillis(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value.toMillis === 'function') return value.toMillis();
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.getTime();
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+function getBearerToken(req) {
+    const header = String((req.headers && (req.headers.authorization || req.headers.Authorization)) || '');
+    const match = /^Bearer\s+(.+)$/i.exec(header);
+    return match ? match[1].trim() : '';
+}
+
+/**
+ * Tạo handler cho POST /api/grade-result.
+ * Tách thành factory (nhận authAdmin + dbAdmin + FieldValue) để dễ kiểm thử mà không cần chạy server thật.
+ */
+function createGradeResultHandler({ authAdmin, dbAdmin, FieldValue }) {
+    return async function gradeResultHandler(req, res) {
+        try {
+            /* ---------- 1) Xác thực: phải có ID token hợp lệ ---------- */
+            const idToken = getBearerToken(req);
+            if (!idToken) throw new HttpError(401, 'Thiếu thông tin đăng nhập.', 'unauthenticated');
+
+            let uid;
+            try {
+                uid = (await authAdmin.verifyIdToken(idToken)).uid;
+            } catch (err) {
+                console.error('Token không hợp lệ hoặc đã hết hạn:', err.message);
+                throw new HttpError(401, 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn.', 'unauthenticated');
+            }
+
+            /* ---------- 2) Kiểm tra dữ liệu gửi lên ---------- */
+            const body = req.body || {};
+            const resultId = typeof body.result_id === 'string' ? body.result_id.trim() : '';
+            if (!resultId || resultId.includes('/')) {
+                throw new HttpError(400, 'Thiếu hoặc sai result_id.', 'invalid-argument');
+            }
+
+            // isExcused phải là boolean thật (client cũ chưa gửi trường này -> coi như false)
+            if (body.isExcused !== undefined && typeof body.isExcused !== 'boolean') {
+                throw new HttpError(400, 'isExcused phải là true hoặc false.', 'invalid-argument');
+            }
+            const isExcused = body.isExcused === true;
+
+            let feedback = '';
+            if (body.teacherFeedback !== undefined && body.teacherFeedback !== null) {
+                if (typeof body.teacherFeedback !== 'string') {
+                    throw new HttpError(400, 'Lời phê phải là chuỗi ký tự.', 'invalid-argument');
+                }
+                feedback = body.teacherFeedback.trim();
+                if (feedback.length > GRADE_FEEDBACK_MAX_CHARS) {
+                    throw new HttpError(400, `Lời phê tối đa ${GRADE_FEEDBACK_MAX_CHARS} ký tự.`, 'invalid-argument');
+                }
+            }
+
+            const expectedSubmitTimeMs = (typeof body.expectedSubmitTimeMs === 'number'
+                && Number.isFinite(body.expectedSubmitTimeMs)) ? body.expectedSubmitTimeMs : null;
+
+            // Điểm chỉ bắt buộc khi KHÔNG miễn thi. (Khi miễn thi, mọi giá trị `score` client gửi đều bị bỏ qua.)
+            let score = null;
+            if (!isExcused) {
+                if (typeof body.score !== 'number' || !Number.isFinite(body.score) || body.score < 0) {
+                    throw new HttpError(400, 'Điểm số phải là một số không âm.', 'invalid-argument');
+                }
+                score = Math.round(body.score * 100) / 100;
+            }
+
+            /* ---------- 3) Đọc + kiểm tra + ghi trong 1 transaction ---------- */
+            const ref = dbAdmin.collection('results').doc(resultId);
+
+            const saved = await dbAdmin.runTransaction(async (tx) => {
+                const snap = await tx.get(ref);
+                if (!snap.exists) {
+                    throw new HttpError(404, 'Không tìm thấy bài làm (có thể đã bị xóa).', 'not-found');
+                }
+                const data = snap.data();
+
+                // Chỉ giáo viên CHỦ của bài mới được chấm / miễn thi
+                if (data.teacher_id !== uid) {
+                    throw new HttpError(403, 'Bạn không có quyền chấm bài làm này.', 'permission-denied');
+                }
+
+                // Học sinh nộp lại trong lúc giáo viên đang chấm -> từ chối, KHÔNG ghi đè lên bài mới.
+                // Giữ dung sai 1ms (như route cũ) để tránh báo 409 oan do làm tròn timestamp;
+                // và chỉ so khi bài có submitTime đọc được.
+                const currentSubmitMs = toMillis(data.submitTime);
+                if (expectedSubmitTimeMs !== null && currentSubmitMs !== null
+                    && Math.abs(Math.floor(currentSubmitMs) - Math.floor(expectedSubmitTimeMs)) > 1) {
+                    throw new HttpError(
+                        409,
+                        'Học sinh vừa nộp lại bài. Bài làm đã được cập nhật, vui lòng chấm lại.',
+                        'submission-changed'
+                    );
+                }
+
+                const update = {
+                    teacherFeedback: feedback,
+                    gradingStatus: 'graded',
+                    gradedAt: FieldValue.serverTimestamp(),
+                    gradedBy: uid
+                };
+
+                if (isExcused) {
+                    // MIỄN THI: bài không có điểm và bị loại khỏi điểm cột / điểm môn (gradebook-engine bỏ qua status 'excused')
+                    update.status = 'excused';
+                    update.excused = true;
+                    update.score = null;
+                } else {
+                    const maxScore = Number(data.maxScore) > 0 ? Number(data.maxScore) : GRADE_DEFAULT_MAX_SCORE;
+                    if (score > maxScore) {
+                        throw new HttpError(400, `Điểm không được lớn hơn ${maxScore}.`, 'invalid-argument');
+                    }
+                    // Bỏ miễn thi (nếu trước đó có) + chấm điểm bình thường: bài quay lại trạng thái đã nộp
+                    update.status = 'submitted';
+                    update.excused = false;
+                    update.score = score;
+                }
+
+                tx.update(ref, update);
+                return { status: update.status, excused: update.excused, score: update.score };
+            });
+
+            return res.json({ ok: true, ...saved });
+        } catch (err) {
+            if (err instanceof HttpError) {
+                return res.status(err.status).json({ ok: false, message: err.message, code: err.code });
+            }
+            console.error('[/api/grade-result] Lỗi không mong đợi:', err);
+            return res.status(500).json({ ok: false, message: 'Lỗi máy chủ khi lưu điểm. Vui lòng thử lại.', code: 'internal' });
+        }
+    };
+}
+
+app.post('/api/grade-result', createGradeResultHandler({ authAdmin, dbAdmin, FieldValue }));
+// ===== GIAI ĐOẠN 4.3 (SpeedGrader) + 4.4 (Miễn thi) — KẾT THÚC: API GIÁO VIÊN CHẤM BÀI / MIỄN THI =====
 
 /**
  * --- (Tính năng mới) FILE ÔN TẬP SAU KHI NỘP BÀI ---
