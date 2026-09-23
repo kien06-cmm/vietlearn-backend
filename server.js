@@ -11,6 +11,19 @@ const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue, FieldPath } = require('firebase-admin/firestore');
 const { getAuth } = require('firebase-admin/auth');
 
+// GĐ 0.1: logic chấm điểm/làm sạch câu hỏi được tách sang lib/grading.js —
+// KHÔNG đụng Firestore/env nên test được trực tiếp bằng `npm test`, và đảm
+// bảo mọi route dưới đây dùng CHUNG 1 bản logic duy nhất (xem lib/grading.js).
+const {
+    getCorrectIndicesServer,
+    getOptionTextsServer,
+    sanitizeQuestionForClient,
+    isManualQuestionServer,
+    extractManualAnswerServer,
+    seededShuffle,
+    gradeSubmission
+} = require('./lib/grading');
+
 /**
  * --- KHỞI TẠO FIREBASE ADMIN SDK — CẤU HÌNH BẰNG SERVICE ACCOUNT ---
  *
@@ -123,83 +136,49 @@ async function verifyFirebaseToken(req, res, next) {
 }
 
 /**
- * Đọc đáp án đúng của 1 câu hỏi, hỗ trợ cả 2 dạng schema đang tồn tại thật
- * trong dữ liệu (xem ghi chú "LỆCH SCHEMA CÂU HỎI" trong hocsinh.js):
- *  - { answers: [{ text, correct: boolean }, ...] }  (dạng AI bóc tách ra)
- *  - { options: string[], correctAnswer: number }     (dạng schema cũ)
+ * GD0/GD1B/GD1A(vá lại) — Middleware xác thực + KIỂM TRA ROLE giáo viên/admin.
+ *
+ * Trước đây /api/extract-questions và /api/compile-math KHÔNG hề có
+ * bất kỳ middleware xác thực nào — bất kỳ ai (kể cả không đăng nhập) cũng
+ * gọi được thẳng 2 route này và đốt GEMINI_API_KEY (tốn tiền/quá
+ * hạn mức) của dự án. Đã vá: buộc phải có Firebase ID token HỢP LỆ (như
+ * verifyFirebaseToken) VÀ uid đó phải có users/{uid}.role === 'giaovien'
+ * HOẶC 'admin' trên Firestore (đọc bằng Admin SDK nên không đụng Rules).
+ *
+ * Lệnh 2 (Giai đoạn 1A): mở rộng thêm role 'admin' bên cạnh 'giaovien' —
+ * trước đó chỉ 'giaovien' mới qua được, admin bị chặn 403 oan.
  */
-function getCorrectIndexServer(q) {
-    if (Array.isArray(q.answers)) {
-        return q.answers.findIndex((a) => a && a.correct === true);
+async function requireTeacherRole(req, res, next) {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
+    if (!idToken) {
+        return res.status(401).json({ message: 'Thiếu token xác thực. Vui lòng đăng nhập lại.' });
     }
-    return typeof q.correctAnswer === 'number' ? q.correctAnswer : -1;
-}
 
-/**
- * Đọc danh sách text các đáp án, hỗ trợ cả 2 dạng schema (xem comment ở
- * getCorrectIndexServer) — dùng cho /api/get-result-detail để trả về danh
- * sách đáp án đã chuẩn hoá, khớp đúng cách hocsinh.js hiển thị lúc làm bài
- * (hàm getOptionTexts() phía client cùng logic).
- */
-function getOptionTextsServer(q) {
-    if (Array.isArray(q.answers)) {
-        return q.answers.map((a) => (a && typeof a.text === 'string') ? a.text : '');
-    }
-    return Array.isArray(q.options) ? q.options : [];
-}
-
-// ===== GIAI ĐOẠN 4.3 — BẮT ĐẦU: helper cho câu hỏi CHẤM TAY (tự luận / nộp file) =====
-
-/** Loại câu hỏi KHÔNG thể tự chấm, phải chờ giáo viên chấm (SpeedGrader). */
-const MANUAL_QUESTION_TYPES = ['essay', 'upload'];
-
-/** Giới hạn độ dài bài tự luận lưu vào results (document Firestore tối đa 1MB). */
-const MAX_ESSAY_LENGTH = 20000;
-
-function isManualQuestionServer(q) {
-    return !!q && MANUAL_QUESTION_TYPES.includes(q.type);
-}
-
-/**
- * Chỉ chấp nhận file nằm trên Cloudinary (https). Học sinh không thể nhét link
- * tuỳ ý (javascript:, trang lạ...) vào results.manualItems[].fileUrl để giáo
- * viên bấm vào lúc chấm bài.
- */
-function isAllowedUploadUrl(value) {
-    if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return false;
     try {
-        const u = new URL(value.trim());
-        return u.protocol === 'https:'
-            && (u.hostname === 'res.cloudinary.com' || u.hostname.endsWith('.cloudinary.com'));
-    } catch (e) {
-        return false;
+        const decoded = await authAdmin.verifyIdToken(idToken);
+        req.uid = decoded.uid;
+
+        const userSnap = await dbAdmin.collection('users').doc(decoded.uid).get();
+        const role = userSnap.exists ? userSnap.data().role : null;
+
+        if (role !== 'giaovien' && role !== 'admin') {
+            return res.status(403).json({ message: 'Chỉ tài khoản giáo viên hoặc admin mới được dùng tính năng này.' });
+        }
+
+        next();
+    } catch (err) {
+        console.error('Xác thực/kiểm tra quyền giáo viên thất bại:', err.message);
+        return res.status(401).json({ message: 'Phiên đăng nhập đã hết hạn hoặc không hợp lệ. Vui lòng đăng nhập lại.' });
     }
 }
 
-/**
- * Lấy câu trả lời của 1 câu chấm tay từ answers[questionId] học sinh gửi lên.
- * Chấp nhận cả dạng chuỗi thuần lẫn object ({ text | essayAnswer | fileUrl | url }).
- */
-function extractManualAnswerServer(q, rawAnswer) {
-    const asObject = (rawAnswer && typeof rawAnswer === 'object' && !Array.isArray(rawAnswer)) ? rawAnswer : null;
+// GĐ 0.1: getCorrectIndicesServer / getCorrectIndexServer / getOptionTextsServer
+// đã chuyển sang lib/grading.js (import ở đầu file) để dùng chung + test được.
 
-    if (q.type === 'essay') {
-        const text = typeof rawAnswer === 'string'
-            ? rawAnswer
-            : (asObject ? (asObject.essayAnswer ?? asObject.text ?? asObject.answer) : '');
-        return { essayAnswer: typeof text === 'string' ? text.trim().slice(0, MAX_ESSAY_LENGTH) : '' };
-    }
-
-    // upload
-    const url = typeof rawAnswer === 'string'
-        ? rawAnswer
-        : (asObject ? (asObject.fileUrl ?? asObject.url) : '');
-    const cleanUrl = typeof url === 'string' ? url.trim() : '';
-    return {
-        fileUrl: isAllowedUploadUrl(cleanUrl) ? cleanUrl : '',
-        fileName: (asObject && typeof asObject.fileName === 'string') ? asObject.fileName.trim().slice(0, 200) : ''
-    };
-}
+// GĐ 0.1: MANUAL_QUESTION_TYPES / isManualQuestionServer / isAllowedUploadUrl /
+// extractManualAnswerServer đã chuyển sang lib/grading.js (import ở đầu file).
 
 /**
  * "Làm lại bài": /api/submit-exam ghi results/{exam}_{student} bằng set() nên bản
@@ -391,34 +370,7 @@ async function getOrStartExamSession(examId, studentId, examData) {
     return startedAtMs;
 }
 
-/**
- * Xáo mảng theo Fisher-Yates, dùng PRNG (mulberry32) được seed bằng 1 chuỗi
- * cố định (examId + studentId) -> luôn ra CÙNG 1 thứ tự cho cùng 1 học sinh
- * + cùng 1 bài thi, kể cả khi họ reload lại trang giữa chừng (tránh đổi thứ
- * tự liên tục gây rối, vì đáp án vẫn được lưu theo questionId nên việc xáo
- * thứ tự không ảnh hưởng gì tới độ chính xác khi chấm điểm).
- */
-function seededShuffle(array, seedString) {
-    let seed = 0;
-    for (let i = 0; i < seedString.length; i++) {
-        seed = (Math.imul(seed, 31) + seedString.charCodeAt(i)) | 0;
-    }
-
-    function nextRandom() {
-        seed |= 0;
-        seed = (seed + 0x6D2B79F5) | 0;
-        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    }
-
-    const result = array.slice();
-    for (let i = result.length - 1; i > 0; i--) {
-        const j = Math.floor(nextRandom() * (i + 1));
-        [result[i], result[j]] = [result[j], result[i]];
-    }
-    return result;
-}
+// GĐ 0.1: seededShuffle đã chuyển sang lib/grading.js (import ở đầu file).
 
 /**
  * --- API Lấy câu hỏi theo Mã phòng thi (GET, dùng cho luồng lam_bai.js) ---
@@ -494,27 +446,10 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
         //    tường minh ở đây để không ai vô tình xoá nhầm field này khi
         //    sửa logic sanitize sau này (điểm dễ quên nhất mỗi khi thêm bớt
         //    field mới trong "questions").
-        const sanitizedQuestions = orderedQuestions.map((q) => {
-            const clean = { ...q };
-
-            if (Array.isArray(clean.answers)) {
-                clean.answers = clean.answers.map((ans) => {
-                    if (!ans || typeof ans !== 'object') return ans;
-                    const { correct, ...rest } = ans;
-                    return rest;
-                });
-            }
-
-            delete clean.correctAnswer;
-            delete clean.essayAnswer;
-            delete clean.explanation; // lời giải chỉ được lộ SAU khi nộp bài (xem /api/get-review-material)
-
-            // Đảm bảo luôn có field "image" (chuỗi rỗng nếu câu hỏi không có
-            // ảnh) để Frontend (lam_bai.js) không cần tự kiểm tra undefined.
-            clean.image = typeof q.image === 'string' ? q.image : '';
-
-            return clean;
-        });
+        // GĐ2: sanitize dùng chung sanitizeQuestionForClient() (khai báo bên
+        // dưới, hoisted) — hỗ trợ cả schema mới (correct_option/image_url)
+        // lẫn schema cũ, tránh 2 nơi tự viết lại logic sanitize rồi lệch nhau.
+        const sanitizedQuestions = orderedQuestions.map(sanitizeQuestionForClient);
 
         return res.json({
             examId,
@@ -535,28 +470,7 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-/**
- * Xoá mọi trường chứa đáp án đúng khỏi 1 câu hỏi trước khi gửi xuống client
- * (cùng logic với bước SANITIZE của GET /api/get-exam-questions ở trên).
- */
-function sanitizeQuestionForClient(q) {
-    const clean = { ...q };
-
-    if (Array.isArray(clean.answers)) {
-        clean.answers = clean.answers.map((ans) => {
-            if (!ans || typeof ans !== 'object') return ans;
-            const { correct, ...rest } = ans;
-            return rest;
-        });
-    }
-
-    delete clean.correctAnswer;
-    delete clean.essayAnswer;
-    delete clean.explanation;
-    clean.image = typeof q.image === 'string' ? q.image : '';
-
-    return clean;
-}
+// GĐ 0.1: sanitizeQuestionForClient đã chuyển sang lib/grading.js (import ở đầu file).
 
 /**
  * --- API THI THỬ của giáo viên (GET) ---
@@ -631,21 +545,23 @@ QUY TẮC BẮT BUỘC:
 1. TUYỆT ĐỐI KHÔNG tự sáng tác, suy luận hay thêm bớt câu hỏi, đáp án hoặc lời giải. Không viết thêm câu hỏi cho "đủ số lượng", không dùng kiến thức bên ngoài tài liệu.
 2. Nếu tài liệu không chứa câu hỏi nào (trắc nghiệm, đúng/sai hoặc tự luận), trả về mảng rỗng [].
 3. Giữ nguyên văn câu hỏi và từng đáp án như trong tài liệu. Không diễn đạt lại, không sửa số liệu.
-4. Đáp án đúng: CHỈ đặt "correct": true khi tài liệu CHỈ RÕ đáp án đúng (đáp án cuối bài, in đậm, gạch chân, dấu đánh dấu). Nếu tài liệu không chỉ rõ, đặt "correct": false cho TẤT CẢ đáp án. TUYỆT ĐỐI KHÔNG tự giải bài để chọn đáp án đúng.
+4. Đáp án đúng (correct_option): CHỈ điền số khi tài liệu CHỈ RÕ đáp án đúng (đáp án cuối bài, in đậm, gạch chân, dấu đánh dấu) — là CHỈ MỤC 0-based của đáp án đó trong mảng "options". Nếu tài liệu không chỉ rõ, đặt "correct_option": null. TUYỆT ĐỐI KHÔNG tự giải bài để chọn đáp án đúng.
 5. "explanation": chỉ lấy lời giải CÓ SẴN trong tài liệu; không có thì để chuỗi rỗng "".
 6. "subject" và "grade": chỉ điền khi tài liệu ghi rõ; không có thì để chuỗi rỗng "". "difficulty": nếu tài liệu không ghi thì dùng "medium".
 7. Công thức toán giữ ở dạng LaTeX: dùng \\( ... \\) cho công thức trong dòng và $$ ... $$ cho công thức riêng dòng.
 
-Trả về MỘT MẢNG JSON duy nhất theo đúng định dạng:
+Trả về MỘT MẢNG JSON duy nhất theo ĐÚNG định dạng chuẩn sau (KHÔNG dùng tên field nào khác):
 [
   {
-    "question": "Nội dung câu hỏi",
+    "question_text": "Nội dung câu hỏi",
     "type": "multiple_choice" | "essay" | "true_false",
     "subject": "Tên môn học (chuỗi rỗng nếu tài liệu không ghi)",
     "grade": "Khối lớp (chuỗi rỗng nếu tài liệu không ghi)",
     "difficulty": "easy" | "medium" | "hard",
     "score": 1,
-    "answers": [{"text": "Đáp án A", "correct": false}, {"text": "Đáp án B", "correct": false}] (Dùng cho trắc nghiệm),
+    "options": ["Đáp án A", "Đáp án B"] (Dùng cho trắc nghiệm/đúng-sai; mảng chuỗi thuần, KHÔNG bọc {text, correct}),
+    "correct_option": 0 (chỉ mục 0-based trong "options" — null nếu tài liệu không chỉ rõ; luôn null với type=essay),
+    "image_url": "",
     "essayAnswer": "Đáp án tự luận mẫu CÓ SẴN trong tài liệu (nếu có)" (Dùng cho tự luận),
     "explanation": "Lời giải có sẵn trong tài liệu (chuỗi rỗng nếu không có)"
   }
@@ -654,15 +570,27 @@ CHỈ TRẢ VỀ CHUỖI JSON, KHÔNG BỌC TRONG MARKDOWN VÀ KHÔNG THÊM VĂN
 
 const EXTRACT_VALID_TYPES = ['multiple_choice', 'essay', 'true_false'];
 
-/** Bỏ mọi phần tử không đúng cấu trúc (thiếu nội dung, sai type, trắc nghiệm thiếu đáp án). */
+/**
+ * GĐ2 (migrate schema): bỏ mọi phần tử không đúng cấu trúc (thiếu nội
+ * dung, sai type, trắc nghiệm thiếu đáp án). Đọc được CẢ raw mới
+ * (question_text/options: string[]) lẫn raw cũ (question/answers[{text,correct}])
+ * — phòng khi Gemini thỉnh thoảng không bám sát đúng system prompt.
+ */
 function sanitizeExtractedQuestions(raw) {
     if (!Array.isArray(raw)) return [];
 
     return raw.filter((q) => {
-        if (!q || typeof q.question !== 'string' || q.question.trim() === '') return false;
+        if (!q) return false;
+        const questionText = typeof q.question_text === 'string' ? q.question_text
+            : (typeof q.question === 'string' ? q.question : '');
+        if (questionText.trim() === '') return false;
         if (!EXTRACT_VALID_TYPES.includes(q.type)) return false;
 
         if (q.type === 'multiple_choice') {
+            if (Array.isArray(q.options)) {
+                return q.options.length >= 2
+                    && q.options.every((o) => typeof o === 'string' && o.trim() !== '');
+            }
             return Array.isArray(q.answers)
                 && q.answers.length >= 2
                 && q.answers.every((a) => a && typeof a.text === 'string' && a.text.trim() !== '');
@@ -671,44 +599,9 @@ function sanitizeExtractedQuestions(raw) {
     });
 }
 
-/**
- * Tải dữ liệu THẬT của 1 Google Form công khai (biến FB_PUBLIC_LOAD_DATA_ nhúng
- * trong trang viewform). Chỉ cho phép docs.google.com/forms và forms.gle để
- * tránh bị lợi dụng làm proxy gọi URL bất kỳ (SSRF). Cần Node 18+ (fetch có sẵn).
- * Lưu ý: trang công khai của Google Forms KHÔNG chứa đáp án đúng.
- */
-async function fetchGoogleFormsData(formsUrl) {
-    let url;
+app.post('/api/extract-questions', requireTeacherRole, async (req, res) => {
     try {
-        url = new URL(formsUrl);
-    } catch (e) {
-        throw new Error('Link Google Forms không hợp lệ.');
-    }
-
-    const isAllowedHost =
-        (url.hostname === 'docs.google.com' && url.pathname.startsWith('/forms/')) ||
-        url.hostname === 'forms.gle';
-    if (url.protocol !== 'https:' || !isAllowedHost) {
-        throw new Error('Link Google Forms không hợp lệ.');
-    }
-
-    const response = await fetch(url.href, { redirect: 'follow' });
-    if (!response.ok) {
-        throw new Error('Không mở được Google Forms. Hãy đặt form ở chế độ "Bất kỳ ai có đường liên kết".');
-    }
-
-    const html = await response.text();
-    const match = html.match(/FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);\s*<\/script>/);
-    if (!match) {
-        throw new Error('Không đọc được nội dung form (form yêu cầu đăng nhập hoặc không công khai).');
-    }
-
-    return match[1].slice(0, 200000);
-}
-
-app.post('/api/extract-questions', async (req, res) => {
-    try {
-        const { source, mimeType, fileBase64, formsUrl } = req.body;
+        const { source, mimeType, fileBase64 } = req.body;
         console.log("Đã nhận yêu cầu xử lý từ frontend:", source);
 
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -730,20 +623,10 @@ app.post('/api/extract-questions', async (req, res) => {
                     }
                 }
             ];
-        } else if (source === 'google-forms' && formsUrl) {
-            let formsData;
-            try {
-                formsData = await fetchGoogleFormsData(formsUrl);
-            } catch (formsError) {
-                return res.status(422).json({ message: formsError.message });
-            }
-            requestContent = [
-                "Dưới đây là dữ liệu thô (JSON) của một Google Form. CHỈ trích xuất các câu hỏi và lựa chọn có trong dữ liệu này. " +
-                "Google Forms không chứa đáp án đúng nên đặt \"correct\": false cho tất cả đáp án. Nếu không có câu hỏi nào, trả về [].\n\n" +
-                formsData
-            ];
         } else {
-            return res.status(400).json({ message: "Thiếu dữ liệu đầu vào (file hoặc link)." });
+            // GD1C: đã gỡ bỏ hoàn toàn luồng Google Forms (fetchGoogleFormsData đã
+            // bị xóa) — route này chỉ còn chấp nhận source === 'file' (PDF).
+            return res.status(400).json({ message: "Thiếu file PDF để xử lý. Hệ thống chỉ hỗ trợ file PDF, không còn hỗ trợ Google Forms." });
         }
 
         const result = await model.generateContent(requestContent);
@@ -770,7 +653,7 @@ app.post('/api/extract-questions', async (req, res) => {
 });
 
 // --- API Xử lý biên dịch Toán học ---
-app.post('/api/compile-math', async (req, res) => {
+app.post('/api/compile-math', requireTeacherRole, async (req, res) => {
     try {
         const { input } = req.body;
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -888,61 +771,19 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         //    từ Firestore chứ không phải dữ liệu client gửi lên.
         //    Cộng điểm theo field "score" của từng câu (nếu có) thay vì chia đều:
         //    câu nào không có "score" thì mặc định coi là 1 điểm.
-        let correctCount = 0;
-        let earnedPoints = 0;
-        let totalPoints = 0;
-        // Mảng đối chiếu ĐẦY ĐỦ — LUÔN được lưu full vào "results" bất kể cờ
-        // hiển thị của giáo viên, để dùng cho giáo viên xem/chấm và cho học
-        // sinh "Xem lại" sau này qua /api/get-result-detail. Việc ẩn bớt field
-        // theo showCorrectAnswers/showExplanation CHỈ áp dụng lên response trả
-        // về ngay lúc nộp bài (xem bước 7 bên dưới), không áp lên dữ liệu lưu.
-        const details = [];
-        // GIAI ĐOẠN 4.3: các câu Tự luận / Upload file KHÔNG tự chấm được -> gom vào
-        // manualItems để giáo viên chấm ở SpeedGrader (quan-ly-ket-qua).
-        const manualItems = [];
-
-        questions.forEach((q) => {
-            if (isManualQuestionServer(q)) {
-                manualItems.push({
-                    questionId: q.id,
-                    type: q.type,
-                    questionText: q.question || q.text || '',
-                    points: Number(q.score) > 0 ? Number(q.score) : 1,
-                    ...extractManualAnswerServer(q, safeAnswers[q.id])
-                });
-                return;
-            }
-
-            const points = Number(q.score) > 0 ? Number(q.score) : 1;
-            totalPoints += points;
-
-            const correctIndex = getCorrectIndexServer(q);
-            const studentAnswer = safeAnswers[q.id];
-            const isCorrect = correctIndex !== -1 && studentAnswer === correctIndex;
-
-            if (isCorrect) {
-                correctCount += 1;
-                earnedPoints += points;
-            }
-
-            details.push({
-                questionId: q.id,
-                studentAnswer: typeof studentAnswer === 'number' ? studentAnswer : null,
-                correctAnswer: correctIndex,
-                isCorrect,
-                points,
-                explanation: typeof q.explanation === 'string' ? q.explanation : ''
-            });
-        });
-
-        const totalQuestions = questions.length;
-        // GIAI ĐOẠN 4.3: có câu chấm tay -> CHƯA có điểm chính thức (score = null,
-        // gradingStatus = 'pending') cho tới khi giáo viên chấm qua /api/grade-result.
-        // autoScore chỉ là điểm riêng của phần trắc nghiệm, để giáo viên tham khảo.
-        const hasManualItems = manualItems.length > 0;
-        const gradingStatus = hasManualItems ? 'pending' : 'graded';
-        const autoScore = totalPoints > 0 ? Number(((earnedPoints / totalPoints) * 10).toFixed(1)) : null;
-        const score = hasManualItems ? null : (autoScore !== null ? autoScore : 0);
+        // GĐ 0.1: logic chấm điểm thuần (trước đây viết thẳng ở đây) đã chuyển sang
+        // gradeSubmission() trong lib/grading.js để test được độc lập (xem
+        // tests/grading.test.js) và để chỉ có DUY NHẤT 1 bản logic chấm điểm.
+        const {
+            correctCount,
+            details,
+            manualItems,
+            totalQuestions,
+            hasManualItems,
+            gradingStatus,
+            autoScore,
+            score
+        } = gradeSubmission(questions, safeAnswers);
 
         // 5. Lấy tên học sinh thật từ hồ sơ (không tin studentName client tự gửi
         //    làm nguồn CHÍNH — chỉ dùng làm dự phòng nếu hồ sơ không có tên).
@@ -1144,23 +985,9 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
 
         // 4. SANITIZE — bước quan trọng nhất. Bỏ sót 1 trường ở đây là lỗ
         //    hổng 0.2 coi như vẫn còn nguyên, chỉ đổi chỗ rò rỉ.
-        const sanitizedQuestions = orderedQuestions.map((q) => {
-            const clean = { ...q };
-
-            if (Array.isArray(clean.answers)) {
-                clean.answers = clean.answers.map((ans) => {
-                    if (!ans || typeof ans !== 'object') return ans;
-                    const { correct, ...rest } = ans; // bỏ field "correct"
-                    return rest;
-                });
-            }
-
-            delete clean.correctAnswer; // schema cũ (options[] + correctAnswer)
-            delete clean.essayAnswer;   // đáp án mẫu tự luận
-            delete clean.explanation;   // lời giải chỉ lộ sau khi nộp bài
-
-            return clean;
-        });
+        // GĐ2: dùng chung sanitizeQuestionForClient() — xem ghi chú ở khai
+        // báo hàm đó (hỗ trợ cả correct_option mới lẫn answers/correctAnswer cũ).
+        const sanitizedQuestions = orderedQuestions.map(sanitizeQuestionForClient);
 
         return res.json({ questions: sanitizedQuestions });
     } catch (error) {
@@ -1286,7 +1113,9 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
                 const q = questionMap[d.questionId] || {};
                 const item = {
                     id: d.questionId,
-                    text: q.question || q.text || '',
+                    // GĐ2: thiếu "question_text" (schema mới) khiến màn Xem lại
+                    // hiện nội dung câu hỏi RỖNG với mọi câu tạo sau migrate.
+                    text: q.question_text || q.question || q.text || '',
                     options: getOptionTextsServer(q),
                     studentAnswer: typeof d.studentAnswer === 'number' ? d.studentAnswer : null,
                     correctAnswer: typeof d.correctAnswer === 'number' ? d.correctAnswer : -1,
@@ -1559,22 +1388,25 @@ async function checkReviewDownloadAccess(examId, examData, studentId) {
 function toReviewQuestionServer(q, includeExplanation) {
     const type = typeof q.type === 'string' ? q.type : 'multiple_choice';
 
-    let correctIndexes = [];
-    if (Array.isArray(q.answers)) {
-        q.answers.forEach((a, i) => { if (a && a.correct === true) correctIndexes.push(i); });
-    } else if (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0) {
-        correctIndexes = [q.correctAnswer];
-    }
+    // GĐ2: dùng chung getCorrectIndicesServer() — hỗ trợ CẢ correct_option
+    // (schema mới, number | number[]) LẪN answers[].correct/correctAnswer
+    // (schema cũ). Trước đây hàm này tự viết lại logic riêng và BỎ SÓT
+    // correct_option -> câu hỏi tạo theo schema mới bị hiện SAI đáp án
+    // đúng (luôn rỗng) trong file ôn tập tải về.
+    const correctIndexes = getCorrectIndicesServer(q);
 
     return {
         id: q.id,
         type,
-        text: q.question || q.text || '',
+        text: q.question_text || q.question || q.text || '',
         options: type === 'essay' ? [] : getOptionTextsServer(q),
         correctIndexes,
         essayAnswer: (type === 'essay' && typeof q.essayAnswer === 'string') ? q.essayAnswer : '',
         explanation: (includeExplanation && typeof q.explanation === 'string') ? q.explanation : '',
-        image: typeof q.image === 'string' ? q.image : '',
+        // "image_url" (schema mới) ưu tiên, vẫn đọc "image" (schema cũ) để
+        // không vỡ dữ liệu chưa migrate — khớp cách sanitizeQuestionForClient() làm.
+        image: typeof q.image_url === 'string' && q.image_url ? q.image_url
+            : (typeof q.image === 'string' ? q.image : ''),
         score: Number(q.score) > 0 ? Number(q.score) : 1
     };
 }
@@ -1625,7 +1457,7 @@ app.post('/api/get-review-material', verifyFirebaseToken, async (req, res) => {
 // Health check: frontend (tailieu.js...) ping route này để "đánh thức" server
 // Render (free tier) và biết server đã sẵn sàng trước khi cho thao tác.
 app.get('/api/health', (req, res) => {
-    return res.status(200).json({ status: 'ok', message: 'Server is running' });
+    return res.status(200).json({ status: 'ok' });
 });
 
 // Lệnh này bắt buộc phải có để server không bị "thoát sớm"
