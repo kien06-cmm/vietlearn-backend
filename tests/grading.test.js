@@ -30,7 +30,9 @@ const {
     isManualQuestionServer,
     isAllowedUploadUrl,
     extractManualAnswerServer,
-    gradeSubmission
+    gradeSubmission,
+    gradeFillBlank,
+    gradeOrdering
 } = require('../lib/grading');
 
 // ============================================================================
@@ -182,6 +184,68 @@ test('sanitizeQuestionForClient', async (t) => {
         const snapshot = JSON.parse(JSON.stringify(original));
         sanitizeQuestionForClient(original);
         assert.deepEqual(original, snapshot);
+    });
+});
+
+// ============================================================================
+// gradeFillBlank — CHẤM ĐIỂM "Điền vào chỗ trống" (FIX: xem ghi chú ở lib/grading.js)
+// Trước đây MỌI câu loại này luôn bị chấm 0 điểm dù trả lời đúng, vì hàm
+// đọc sai tên field (accepted_answers thay vì acceptedAnswers) và sai định
+// dạng đáp án học sinh gửi lên (object theo id thay vì mảng theo vị trí).
+// ============================================================================
+test('gradeFillBlank', async (t) => {
+    await t.test('học sinh điền đúng HẤT các ô trống -> fraction = 1', () => {
+        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }, { acceptedAnswers: ['1945']}] };
+        const result = gradeFillBlank(q, ['Hà Nội', '1945']);
+        assert.equal(result.fraction, 1);
+    });
+
+    await t.test('không phân biệt hoa/thường và có/không dấu (khớp normalizeBlankAnswer của gradebook-engine.js)', () => {
+        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }] };
+        const result = gradeFillBlank(q, ['  ha NOI  ']);
+        assert.equal(result.fraction, 1);
+    });
+
+    await t.test('điền đúng MỘT PHẦN số ô -> fraction từ phần (không phải 0 hoặc 1)', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }, { acceptedAnswers: ['B'] }] };
+        const result = gradeFillBlank(q, ['A', 'sai']);
+        assert.equal(result.fraction, 0.5);
+    });
+
+    await t.test('trả lời sai hết -> fraction = 0', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
+        const result = gradeFillBlank(q, ['B']);
+        assert.equal(result.fraction, 0);
+    });
+
+    await t.test('không trả lời gì (mảng rỗng) -> fraction = 0, không crash', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
+        const result = gradeFillBlank(q, []);
+        assert.equal(result.fraction, 0);
+    });
+
+    await t.test('gửi lên object theo id (định dạng SAI của bản cũ) -> không crash, coi như chưa trả lời', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
+        const result = gradeFillBlank(q, { blank_1: 'A' });
+        assert.equal(result.fraction, 0);
+    });
+
+    await t.test('câu hỏi không có blanks nào -> fraction = 0, không chia cho 0', () => {
+        const result = gradeFillBlank({ blanks: [] }, ['A']);
+        assert.equal(result.fraction, 0);
+        assert.deepEqual(result.correctAnswerForDetail, []);
+    });
+});
+
+test('gradeSubmission — tích hợp fill_blank (FIX)', async (t) => {
+    await t.test('câu fill_blank điền đúng được cộng điểm đầy đủ thay vì luôn bị 0 như trước', () => {
+        const questions = [
+            { id: 'q1', type: 'fill_blank', score: 2, blanks: [{ acceptedAnswers: ['Hà Nội'] }] }
+        ];
+        const result = gradeSubmission(questions, { q1: ['hà nội'] });
+        assert.equal(result.details[0].isCorrect, true);
+        assert.equal(result.earnedPoints, 2);
+        assert.equal(result.correctCount, 1);
     });
 });
 
@@ -449,6 +513,101 @@ test('isAllowedUploadUrl', () => {
     assert.equal(isAllowedUploadUrl(''), false);
     assert.equal(isAllowedUploadUrl(null), false);
     assert.equal(isAllowedUploadUrl(123), false);
+});
+
+// ============================================================================
+// gradeFillBlank — FIX: mảng theo vị trí (KHÔNG phải object theo id) +
+// field "acceptedAnswers" (camelCase, KHÔNG phải "accepted_answers") + so
+// khớp không phân biệt hoa/thường và có/không dấu tiếng Việt — khớp
+// normalizeBlankAnswer() trong core/gradebook-engine.js phía frontend.
+// ============================================================================
+test('gradeFillBlank', async (t) => {
+    await t.test('trả lời đúng theo đúng thứ tự mảng -> fraction = 1', () => {
+        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }, { acceptedAnswers: ['1945'] }] };
+        const result = gradeFillBlank(q, ['Hà Nội', '1945']);
+        assert.equal(result.fraction, 1);
+    });
+
+    await t.test('không phân biệt hoa/thường và có/không dấu tiếng Việt', () => {
+        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }] };
+        assert.equal(gradeFillBlank(q, ['ha noi']).fraction, 1);
+        assert.equal(gradeFillBlank(q, ['HÀ NỘI']).fraction, 1);
+        assert.equal(gradeFillBlank(q, ['  hà   nội  ']).fraction, 1);
+    });
+
+    await t.test('đúng 1/2 ô trống -> fraction = 0.5', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }, { acceptedAnswers: ['B'] }] };
+        const result = gradeFillBlank(q, ['A', 'sai']);
+        assert.equal(result.fraction, 0.5);
+    });
+
+    await t.test('trả lời dạng object theo id (định dạng CŨ, SAI) -> không khớp được gì, fraction = 0', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
+        const result = gradeFillBlank(q, { blank_1: 'A' });
+        assert.equal(result.fraction, 0);
+    });
+
+    await t.test('field "accepted_answers" (snake_case CŨ, SAI) không được đọc -> luôn sai dù trả lời đúng', () => {
+        const q = { blanks: [{ accepted_answers: ['A'] }] };
+        const result = gradeFillBlank(q, ['A']);
+        assert.equal(result.fraction, 0);
+    });
+
+    await t.test('bỏ trống 1 ô -> ô đó tính sai, không crash', () => {
+        const q = { blanks: [{ acceptedAnswers: ['A'] }, { acceptedAnswers: ['B'] }] };
+        const result = gradeFillBlank(q, ['A']);
+        assert.equal(result.fraction, 0.5);
+    });
+
+    await t.test('câu hỏi không có "blanks" nào -> fraction = 0, không crash', () => {
+        assert.equal(gradeFillBlank({}, ['A']).fraction, 0);
+    });
+
+    await t.test('gradeSubmission: câu fill_blank hỗn hợp với trắc nghiệm -> chấm điểm từng phần đúng', () => {
+        const questions = [
+            { id: 'q1', type: 'multiple_choice', correct_option: 0, score: 1 },
+            { id: 'q2', type: 'fill_blank', score: 4, blanks: [{ acceptedAnswers: ['Hà Nội'] }, { acceptedAnswers: ['1945'] }] }
+        ];
+        const result = gradeSubmission(questions, { q1: 0, q2: ['ha noi', 'sai'] });
+        assert.equal(result.totalPoints, 5);
+        assert.equal(result.earnedPoints, 1 + 4 * 0.5);
+        assert.equal(result.details.find((d) => d.questionId === 'q2').partialFraction, 0.5);
+    });
+});
+
+// ============================================================================
+// gradeOrdering — (GĐ3.6.2) thêm "correctOrder" tách đáp án đúng khỏi
+// thứ tự lưu trong "items", vẫn giữ được câu hỏi cũ chưa có field này.
+// ============================================================================
+test('gradeOrdering', async (t) => {
+    await t.test('có "correctOrder": chấm theo correctOrder, KHÔNG theo thứ tự "items"', () => {
+        const q = {
+            items: [{ id: 'b' }, { id: 'a' }, { id: 'c' }], // thứ tự hiển thị/lưu, KHÔNG phải đáp án
+            correctOrder: ['a', 'b', 'c']
+        };
+        const result = gradeOrdering(q, ['a', 'b', 'c']);
+        assert.equal(result.fraction, 1);
+        assert.deepEqual(result.correctAnswerForDetail, ['a', 'b', 'c']);
+    });
+
+    await t.test('không có "correctOrder" (dữ liệu cũ) -> dự phòng bằng thứ tự "items" như trước', () => {
+        const q = { items: [{ id: 'x' }, { id: 'y' }] };
+        const result = gradeOrdering(q, ['x', 'y']);
+        assert.equal(result.fraction, 1);
+        assert.deepEqual(result.correctAnswerForDetail, ['x', 'y']);
+    });
+
+    await t.test('đúng 1/3 vị trí theo correctOrder -> fraction = 1/3', () => {
+        const q = { items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }], correctOrder: ['a', 'b', 'c'] };
+        const result = gradeOrdering(q, ['a', 'x', 'y']);
+        assert.equal(result.fraction, 1 / 3);
+    });
+
+    await t.test('không có items lẫn correctOrder -> fraction = 0, không chia cho 0', () => {
+        const result = gradeOrdering({}, ['a']);
+        assert.equal(result.fraction, 0);
+        assert.deepEqual(result.correctAnswerForDetail, []);
+    });
 });
 
 test('extractManualAnswerServer', async (t) => {

@@ -21,7 +21,9 @@ const {
     isManualQuestionServer,
     extractManualAnswerServer,
     seededShuffle,
-    gradeSubmission
+    gradeSubmission,
+    normalizeQuestionType,
+    translateMatchingAnswer
 } = require('./lib/grading');
 
 /**
@@ -225,6 +227,14 @@ async function loadExamForStudent(examId, studentId) {
         return { ok: false, status: 403, message: 'Bài kiểm tra đã đóng hoặc chưa mở, không thể tiếp tục.' };
     }
 
+    // Bài "chơi vui" (không gắn lớp, tao-bai-kiem-tra.js ghi class_id: '') -> bỏ qua
+    // hoàn toàn bước kiểm tra thành viên lớp: bất kỳ ai có tài khoản đăng nhập đều
+    // vào được miễn có đúng mã phòng. Có class_id thật thì vẫn giữ nguyên luật cũ: chỉ
+    // thành viên active của lớp đó mới vào được.
+    if (!examData.class_id) {
+        return { ok: true, examData };
+    }
+
     const memberSnap = await dbAdmin
         .collection('class_members')
         .doc(`${studentId}_${examData.class_id}`)
@@ -307,6 +317,12 @@ async function loadExamForStudentByRoomCode(roomCode, studentId) {
 
     const examDoc = examsSnap.docs[0];
     const examData = examDoc.data();
+
+    // Bài "chơi vui" (class_id rỗng) -> ai có mã phòng cũng vào được, không cần là
+    // thành viên lớp nào (xem giải thích ở loadExamForStudent()).
+    if (!examData.class_id) {
+        return { ok: true, examId: examDoc.id, examData };
+    }
 
     const memberSnap = await dbAdmin
         .collection('class_members')
@@ -449,7 +465,13 @@ app.get('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
         // GĐ2: sanitize dùng chung sanitizeQuestionForClient() (khai báo bên
         // dưới, hoisted) — hỗ trợ cả schema mới (correct_option/image_url)
         // lẫn schema cũ, tránh 2 nơi tự viết lại logic sanitize rồi lệch nhau.
-        const sanitizedQuestions = orderedQuestions.map(sanitizeQuestionForClient);
+        // (GĐ3.5/3.6) seed riêng theo TỪNG câu hỏi (examId_studentId_questionId)
+        // để buildMatchingView()/buildOrderingView() xáo khác nhau giữa các câu
+        // — KHÔNG được gọi sanitizeQuestionForClient trần trong .map() (2 tham
+        // số ẩn index/array của .map sẽ bị hiểu nhầm thành seed).
+        const sanitizedQuestions = orderedQuestions.map(
+            (q) => sanitizeQuestionForClient(q, `${examId}_${studentId}_${q.id}`)
+        );
 
         return res.json({
             examId,
@@ -520,7 +542,9 @@ app.get('/api/preview-exam', verifyFirebaseToken, async (req, res) => {
             duration: examData.duration || 15,
             allowSkip: examData.allowSkip !== false,
             allowFlagForReview: examData.allowFlagForReview === true,
-            questions: orderedQuestions.map(sanitizeQuestionForClient)
+            // (GĐ3.5/3.6) Giáo viên thi thử không có studentId thật -> dùng chính
+            // uid giáo viên làm phần seed, vẫn xáo nhất quán như học sinh thật.
+            questions: orderedQuestions.map((q) => sanitizeQuestionForClient(q, `${examId}_${req.uid}_${q.id}`))
         });
     } catch (error) {
         console.error('Lỗi thi thử bài kiểm tra:', error);
@@ -528,16 +552,14 @@ app.get('/api/preview-exam', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// --- API Xử lý Bóc tách tài liệu (PDF/Word/Forms) ---
+// --- API Xử lý Bóc tách tài liệu (file tải lên, source === 'file') ---
 //
-// CHỐNG "BỊA" CÂU HỎI (hallucination) — 4 lớp:
+// CHỐNG "BỊA" CÂU HỎI (hallucination) — 3 lớp:
 //   1. System prompt: AI chỉ là công cụ TRÍCH XUẤT, cấm sáng tác, không có
 //      câu hỏi thì trả [].
 //   2. temperature: 0 + responseMimeType JSON: bớt "sáng tạo", output đúng cấu trúc.
-//   3. Google Forms: Gemini KHÔNG mở được URL. Bản cũ chỉ đưa cho nó cái link
-//      -> nó tự bịa câu hỏi cho có. Nay server tự tải form, đưa DỮ LIỆU THẬT
-//      của form cho AI trích xuất.
-//   4. Kiểm tra lại output: bỏ mọi câu hỏi sai cấu trúc trước khi trả về.
+//   3. Kiểm tra lại output: bỏ mọi câu hỏi sai cấu trúc trước khi trả về.
+//   (Google Forms đã bị gỡ hoàn toàn: không còn bước tự tải form; route chỉ nhận source === 'file'.)
 const EXTRACT_SYSTEM_PROMPT = `Bạn LÀ công cụ trích xuất dữ liệu, KHÔNG phải người soạn đề.
 Nhiệm vụ: CHỈ ĐƯỢC trích xuất những câu hỏi CÓ SẴN trong tài liệu được cung cấp.
 
@@ -766,6 +788,25 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         //    phần tử tuỳ phiên bản; giữ 10 cho an toàn, khớp cách hocsinh.js đang làm)
         const questions = await fetchQuestionsByIds(questionIds);
 
+        // 3b. (GĐ3.5) Câu "Ghép đôi": học sinh nộp { [leftId]: rightToken } —
+        // rightToken là VỊ TRÍ trong cột phải ĐÃ XÁO gửi lúc GET/POST
+        // /api/get-exam-questions (xem buildMatchingView() trong lib/grading.js),
+        // không phải id thật. Phải dịch ngược về { [leftId]: rightId } bằng ĐÚNG
+        // seed đã dùng lúc gửi (examId_studentId_questionId) trước khi đưa vào
+        // gradeSubmission() — nếu không, gradeMatching() sẽ so sánh nhầm token
+        // với id và chấm SAI 100% mọi câu ghép đôi. Không cần bước tương tự cho
+        // "ordering": id các mục không bị đổi, chỉ vị trí bị xáo lúc gửi, nên
+        // mảng thứ tự học sinh nộp (gồm toàn id thật) đã đúng định dạng
+        // gradeOrdering() cần, không phải dịch gì thêm.
+        const translatedAnswers = { ...safeAnswers };
+        questions.forEach((q) => {
+            if (normalizeQuestionType(q.type) === 'matching') {
+                translatedAnswers[q.id] = translateMatchingAnswer(
+                    q, safeAnswers[q.id], `${exam_id}_${studentId}_${q.id}`
+                );
+            }
+        });
+
         // 4. CHẤM ĐIỂM THẬT — đây là phần học sinh không thể giả mạo được nữa vì
         //    toàn bộ logic này chạy trên server, dùng đáp án đúng lấy trực tiếp
         //    từ Firestore chứ không phải dữ liệu client gửi lên.
@@ -783,7 +824,7 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             gradingStatus,
             autoScore,
             score
-        } = gradeSubmission(questions, safeAnswers);
+        } = gradeSubmission(questions, translatedAnswers);
 
         // 5. Lấy tên học sinh thật từ hồ sơ (không tin studentName client tự gửi
         //    làm nguồn CHÍNH — chỉ dùng làm dự phòng nếu hồ sơ không có tên).
@@ -987,7 +1028,10 @@ app.post('/api/get-exam-questions', verifyFirebaseToken, async (req, res) => {
         //    hổng 0.2 coi như vẫn còn nguyên, chỉ đổi chỗ rò rỉ.
         // GĐ2: dùng chung sanitizeQuestionForClient() — xem ghi chú ở khai
         // báo hàm đó (hỗ trợ cả correct_option mới lẫn answers/correctAnswer cũ).
-        const sanitizedQuestions = orderedQuestions.map(sanitizeQuestionForClient);
+        // (GĐ3.5/3.6) seed riêng theo từng câu — xem ghi chú ở nhánh GET phía trên.
+        const sanitizedQuestions = orderedQuestions.map(
+            (q) => sanitizeQuestionForClient(q, `${exam_id}_${studentId}_${q.id}`)
+        );
 
         return res.json({ questions: sanitizedQuestions });
     } catch (error) {
@@ -1089,6 +1133,23 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
             gradingStatus: resultData.gradingStatus || 'graded'
         };
 
+        // GĐ3.4 (FIX): câu Tự luận / Upload trong bài hỗn hợp không nằm trong
+        // "details" (gradeSubmission() tách riêng ra "manualItems" trong lib/grading.js)
+        // nên trước đây route này KHÔNG BAO GIỜ trả field này về client -> khối
+        // "Bài tự luận của bạn" ở ketqua.js (collectManualItems()) luôn trống dù
+        // học sinh đã làm câu tự luận/nộp file. Hiện lại đúng bài học sinh đã viết/
+        // nộp, KHÔNG phụ thuộc cờ hiển thị điểm (khớp thiết kế sẵn có của
+        // ketqua.js/renderExtras() — không gate theo scoreVisible).
+        if (Array.isArray(resultData.manualItems) && resultData.manualItems.length > 0) {
+            responsePayload.manualItems = resultData.manualItems.map((item) => ({
+                type: (item && item.type === 'upload') ? 'upload' : 'essay',
+                questionText: (item && typeof item.questionText === 'string') ? item.questionText : '',
+                essayAnswer: (item && typeof item.essayAnswer === 'string') ? item.essayAnswer : '',
+                fileUrl: (item && typeof item.fileUrl === 'string') ? item.fileUrl : '',
+                fileName: (item && typeof item.fileName === 'string') ? item.fileName : ''
+            }));
+        }
+
         if (scoreVisible) {
             responsePayload.score = (resultData.score === undefined) ? null : resultData.score;
             if (typeof resultData.teacherFeedback === 'string' && resultData.teacherFeedback.trim() !== '') {
@@ -1111,16 +1172,70 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
 
             responsePayload.questions = fullDetails.map((d) => {
                 const q = questionMap[d.questionId] || {};
+                // GĐ3.3 (FIX): thiếu "type" khiến ketqua.js không bao giờ nhận ra được
+                // câu "Điền vào chỗ trống" (fill_blank) — mọi câu đều bị vẽ nhầm
+                // thành thẻ trắc nghiệm A/B/C/D rỗng ở màn "Xem lại".
+                const canonicalType = typeof q.type === 'string' ? q.type : 'multiple_choice';
                 const item = {
                     id: d.questionId,
+                    type: canonicalType,
                     // GĐ2: thiếu "question_text" (schema mới) khiến màn Xem lại
                     // hiện nội dung câu hỏi RỖNG với mọi câu tạo sau migrate.
                     text: q.question_text || q.question || q.text || '',
                     options: getOptionTextsServer(q),
-                    studentAnswer: typeof d.studentAnswer === 'number' ? d.studentAnswer : null,
-                    correctAnswer: typeof d.correctAnswer === 'number' ? d.correctAnswer : -1,
+                    // (GĐ3.2) Câu "Chọn nhiều" (multiple_answer): gradeSubmission() ghi
+                    // studentAnswer/correctAnswer dạng MẢNG chỉ số (xem lib/grading.js).
+                    // Bản cũ chỉ nhận `typeof === 'number'` nên âm thầm ép toàn bộ câu
+                    // "Chọn nhiều" về null/-1 — ketqua.js hiện sai thành "Bỏ qua" dù học
+                    // sinh đã trả lời, và không bao giờ tô được đáp án đúng.
+                    studentAnswer: Array.isArray(d.studentAnswer) ? d.studentAnswer
+                        : (typeof d.studentAnswer === 'number' ? d.studentAnswer : null),
+                    correctAnswer: Array.isArray(d.correctAnswer) ? d.correctAnswer
+                        : (typeof d.correctAnswer === 'number' ? d.correctAnswer : -1),
                     isCorrect: d.isCorrect === true
                 };
+                // GĐ3.3 (FIX): câu "Điền vào chỗ trống" không dùng options/correctAnswer
+                // kiểu chỉ số như trắc nghiệm — ketqua.js (evaluateFillBlankQuestion)
+                // cần field "blanks": [{ acceptedAnswers }] theo ĐÚNG thứ tự chỗ trống
+                // để tự so khớp câu trả lời + hiện "Đáp án đúng" cho từng ô sai. Nguồn
+                // là d.correctAnswer, lúc này là mảng { index, acceptedAnswers } do
+                // gradeFillBlank() (lib/grading.js) ghi vào "details" lúc nộp bài.
+                if (canonicalType === 'fill_blank' && Array.isArray(d.correctAnswer)) {
+                    item.blanks = d.correctAnswer.map((b) => ({
+                        acceptedAnswers: Array.isArray(b && b.acceptedAnswers) ? b.acceptedAnswers : []
+                    }));
+                }
+                // (FIX — audit GIĐ 3.5.6) câu "Ghép đôi" không dùng options/correctAnswer
+                // kiểu chỉ số như trắc nghiệm — pages/hocsinh/ketqua.js
+                // (evaluateMatchingPairs() trong core/gradebook-engine.js) cần field
+                // "pairs": [{ left, right, studentRight, isCorrect }] theo ĐÚNG thứ tự
+                // cặp gốc để tự vẽ bảng đối chiếu + tính "x/y cặp đúng". Nguồn:
+                //   - d.correctAnswer: mảng { id, left, right } CHUẨN của tất cả cặp
+                //     (gradeMatching() trong lib/grading.js ghi vào "details" lúc nộp bài).
+                //   - d.studentAnswer: object { [leftId]: rightId } ĐÃ DỌCH NGƯỢC về id
+                //     thật (translateMatchingAnswer() trong route /api/submit-exam đã dịch
+                //     trước khi gọi gradeSubmission() — xem ghi chú ở đó), KHÔNG phải
+                //     token đã xáo như lúc gửi đề cho học sinh.
+                // KHÔNG dùng được item.studentAnswer chung ở trên cho mục đích này vì
+                // d.studentAnswer là OBJECT (không phải mảng/số) nên nhánh chung đã ép
+                // về null ở trên — phải đọc lại trực tiếp từ d.studentAnswer ở đây.
+                if (canonicalType === 'matching' && Array.isArray(d.correctAnswer)) {
+                    const studentMap = (d.studentAnswer && typeof d.studentAnswer === 'object' && !Array.isArray(d.studentAnswer))
+                        ? d.studentAnswer : {};
+                    const pairById = {};
+                    d.correctAnswer.forEach((p) => { if (p && p.id !== undefined && p.id !== null) pairById[p.id] = p; });
+
+                    item.pairs = d.correctAnswer.map((p) => {
+                        const chosenId = studentMap[p.id];
+                        const chosenPair = (chosenId !== undefined && chosenId !== null) ? pairById[chosenId] : null;
+                        return {
+                            left: p.left,
+                            right: p.right,
+                            studentRight: chosenPair ? chosenPair.right : '',
+                            isCorrect: (chosenId !== undefined && chosenId !== null) ? String(chosenId) === String(p.id) : false
+                        };
+                    });
+                }
                 if (explanationVisible) {
                     item.explanation = typeof d.explanation === 'string' ? d.explanation : '';
                 }
