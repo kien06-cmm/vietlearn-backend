@@ -1236,6 +1236,36 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
                         };
                     });
                 }
+                // (GĐ3.6.6 — Auto-grade "Sắp xếp", hoàn thiện dữ liệu cho "Xem lại")
+                // gradeOrdering() (lib/grading.js) lưu vào "details" 2 mảng ID:
+                //   - d.correctAnswer : correctIds (mảng id) theo ĐÚNG thứ tự chuẩn.
+                //   - d.studentAnswer : mảng id theo thứ tự học sinh ĐÃ SẮP lúc nộp bài.
+                // Trong khi evaluateOrdering() (core/gradebook-engine.js, dùng ở
+                // ketqua.js) chỉ so được 2 mảng CHỈ SỐ (không phải id), nên cần dịch:
+                //   - item.items            : mảng TEXT theo ĐÚNG thứ tự chuẩn — tra text
+                //     theo từng id trong q.items (dữ liệu THẬT lấy từ fetchQuestionsByIds(),
+                //     CHƯA xáo trộn — khác bản sanitize gửi lúc làm bài).
+                //   - item.studentPositions : mảng CHỈ SỐ (0-based, trỏ vào item.items) —
+                //     dịch từng id học sinh đặt ở vị trí i sang đúng VỊ TRÍ CHUẨN của id
+                //     đó trong correctIds, để evaluateOrdering() so "order[i] === i" ra
+                //     đúng/sai từng vị trí (giống cách renderMatchingQuestionCard() đã làm
+                //     cho câu Ghép đôi ở trên).
+                if (canonicalType === 'ordering' && Array.isArray(d.correctAnswer)) {
+                    const correctIds = d.correctAnswer;
+                    const textById = {};
+                    (Array.isArray(q.items) ? q.items : []).forEach((it) => {
+                        if (it && it.id !== undefined && it.id !== null) textById[it.id] = it.text;
+                    });
+                    item.items = correctIds.map((id) => (textById[id] !== undefined ? textById[id] : ''));
+
+                    const positionById = {};
+                    correctIds.forEach((id, pos) => { positionById[id] = pos; });
+                    const studentOrderIds = Array.isArray(d.studentAnswer) ? d.studentAnswer : [];
+                    item.studentPositions = studentOrderIds.map((id) => {
+                        const pos = positionById[id];
+                        return typeof pos === 'number' ? pos : -1;
+                    });
+                }
                 if (explanationVisible) {
                     item.explanation = typeof d.explanation === 'string' ? d.explanation : '';
                 }
