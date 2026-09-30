@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test tests/grading.test.js"
+    "test": "node --test tests/grading.test.js tests/ordering.test.js tests/review-export.test.js"
   },
   "keywords": [],
   "author": "",

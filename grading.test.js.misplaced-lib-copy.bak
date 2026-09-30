@@ -100,11 +100,6 @@ function getOptionTextsServer(q) {
  * (clean = { ...q } giữ nguyên mọi field lạ) -> học sinh đọc được thứ tự đúng
  * ngay trong tab Network. Giờ xoá cho MỌI loại câu hỏi và truyền nó vào
  * buildOrderingView() để việc xáo trộn không bao giờ trùng thứ tự đúng.
- *
- * (GĐ3.6.8 — FIX) "fill_blank": q.blanks gốc là [{ acceptedAnswers: [...] }] —
- * chính là ĐÁP ÁN ĐÚNG của từng chỗ trống nhưng bản trước để lọt nguyên xi
- * xuống client. lam_bai.js chỉ cần SỐ chỗ trống (tự đếm từ nội dung câu hỏi,
- * xem countBlanksInContent()) nên chỉ gửi xuống { index } cho mỗi chỗ trống.
  */
 function sanitizeQuestionForClient(q, seed) {
     const clean = { ...q };
@@ -128,10 +123,6 @@ function sanitizeQuestionForClient(q, seed) {
     // (GĐ3.6.8) đáp án của câu "Sắp xếp" — TUYỆT ĐỐI không gửi xuống client.
     delete clean.correctOrder;
 
-    // (GĐ3.7) đáp án của câu "Kéo-thả" (correctMap: { [zoneId]: itemId }) — TUYỆT ĐỐI không
-    // gửi xuống client. Bản đọc lại từ q (không phải clean) được dùng bên dưới để xáo thẻ.
-    delete clean.correctMap;
-
     const canonicalType = normalizeQuestionType(q.type);
     if (canonicalType === 'matching' && Array.isArray(clean.pairs)) {
         clean.pairs = seed ? buildMatchingView(clean.pairs, seed) : { left: [], right: [] };
@@ -139,17 +130,6 @@ function sanitizeQuestionForClient(q, seed) {
     if (canonicalType === 'ordering' && Array.isArray(clean.items)) {
         // Dùng q.correctOrder (bản gốc), không phải clean.correctOrder (đã xoá ở trên).
         clean.items = seed ? buildOrderingView(clean.items, seed, q.correctOrder) : [];
-    }
-    if (canonicalType === 'drag_drop') {
-        // (GĐ3.7) Chỉ gửi { id, text } của thẻ (đã xáo) và { id, label } của ô thả — không có
-        // correctMap, không field lạ nào khác. Không có seed -> ẨN HẲN như ordering/matching.
-        const view = seed ? buildDragDropView(q, seed) : { dragItems: [], dropZones: [] };
-        clean.dragItems = view.dragItems;
-        clean.dropZones = view.dropZones;
-    }
-    if (canonicalType === 'fill_blank' && Array.isArray(clean.blanks)) {
-        // (GĐ3.6.8) Chỉ giữ lại SỐ LƯỢNG chỗ trống, không gửi acceptedAnswers.
-        clean.blanks = clean.blanks.map((_, index) => ({ index }));
     }
 
     // "image_url" (schema mới) — luôn trả chuỗi rỗng nếu không có ảnh, vẫn
@@ -163,14 +143,6 @@ function sanitizeQuestionForClient(q, seed) {
 
 /** Loại câu hỏi KHÔNG thể tự chấm, phải chờ giáo viên chấm (SpeedGrader). */
 const MANUAL_QUESTION_TYPES = ['essay', 'upload'];
-
-// (GĐ3.7B) Logic chấm / dựng dữ liệu "Xem lại" / file ôn tập của câu Kéo-thả nằm ở lib/dragdrop.js.
-const {
-    gradeDragDrop,
-    buildDragDropResultView,
-    buildDragDropTexts,
-    buildDragDropReview
-} = require('./dragdrop');
 
 // GIĐ 3.1 — Đổi tên HIỂN THỊ cho rõ nghĩa hơn (multi_select / open_ended), giữ
 // NGUYÊN giá trị thật lưu trong Firestore (multiple_answer / essay) đúng theo
@@ -264,40 +236,15 @@ function seededShuffle(array, seedString) {
 }
 
 /**
- * (GĐ3.6.8) Các mục của câu "Sắp xếp" theo ĐÚNG thứ tự đáp án, dạng
- * [{ id, text }]. Dùng "correctOrder" nếu có, dự phòng bằng thứ tự mảng
- * "items" (dữ liệu tạo trước GĐ3.6.2) — cùng quy tắc với gradeOrdering().
- * Dùng cho file ôn tập PDF/Word (toReviewQuestionServer).
- */
-function getOrderedItemsServer(q) {
-    const items = Array.isArray(q.items) ? q.items : [];
-    const byId = {};
-    items.forEach((it) => {
-        if (it && it.id !== undefined && it.id !== null) byId[it.id] = it;
-    });
-    const ids = (Array.isArray(q.correctOrder) && q.correctOrder.length > 0)
-        ? q.correctOrder
-        : items.map((it) => (it ? it.id : undefined));
-    return ids.map((id) => ({
-        id,
-        text: (byId[id] && typeof byId[id].text === 'string') ? byId[id].text : ''
-    }));
-}
-
-/**
  * Chuẩn hoá 1 câu hỏi về dạng gọn cho file ôn tập — dùng chung
  * getCorrectIndicesServer()/getOptionTextsServer() để hỗ trợ CẢ schema mới
  * (correct_option) LẪN schema cũ (answers[].correct/correctAnswer).
- *
- * (GĐ3.6.8) Câu "Sắp xếp" không có options/correct_option — thêm
- * "orderedItems" (các mục theo đúng thứ tự đáp án) để PDF/Word hiện được đề
- * và đáp án. Các loại câu khác KHÔNG có field này.
  */
 function toReviewQuestionServer(q, includeExplanation) {
     const type = typeof q.type === 'string' ? q.type : 'multiple_choice';
     const correctIndexes = getCorrectIndicesServer(q);
 
-    const review = {
+    return {
         id: q.id,
         type,
         text: q.question_text || q.question || q.text || '',
@@ -309,15 +256,6 @@ function toReviewQuestionServer(q, includeExplanation) {
             : (typeof q.image === 'string' ? q.image : ''),
         score: Number(q.score) > 0 ? Number(q.score) : 1
     };
-
-    if (normalizeQuestionType(type) === 'ordering') {
-        review.orderedItems = getOrderedItemsServer(q);
-    }
-    if (normalizeQuestionType(type) === 'drag_drop') {
-        // (GĐ3.7B) dragDropPairs [{label,text}] + dragDropDistractors [text] — xem lib/dragdrop.js
-        Object.assign(review, buildDragDropReview(q));
-    }
-    return review;
 }
 
 /**
@@ -356,16 +294,12 @@ function normalizeBlankAnswerServer(value) {
  *      "acceptedAnswers" (camelCase, xem collectBlanksFromForm()), không
  *      phải "accepted_answers" (snake_case) như bản cũ đọc.
  * Xem tests/grading.test.js — mọi thay đổi ở hàm này PHẢI chạy `npm test`.
- *
- * (GĐ3.6.8) Trả thêm `skipped` (true khi KHÔNG có ô nào được điền) — chỉ
- * thêm field, không đổi các field cũ.
  */
 function gradeFillBlank(q, rawStudentAnswer) {
     const blanks = Array.isArray(q.blanks) ? q.blanks : [];
     const studentList = Array.isArray(rawStudentAnswer) ? rawStudentAnswer : [];
-    const skipped = !studentList.some((v) => typeof v === 'string' && v.trim() !== '');
 
-    if (blanks.length === 0) return { fraction: 0, studentAnswerNormalized: studentList, correctAnswerForDetail: [], skipped };
+    if (blanks.length === 0) return { fraction: 0, studentAnswerNormalized: studentList, correctAnswerForDetail: [] };
 
     let correctBlanks = 0;
     blanks.forEach((blank, i) => {
@@ -383,8 +317,7 @@ function gradeFillBlank(q, rawStudentAnswer) {
         correctAnswerForDetail: blanks.map((b, i) => ({
             index: i,
             acceptedAnswers: Array.isArray(b.acceptedAnswers) ? b.acceptedAnswers : []
-        })),
-        skipped
+        }))
     };
 }
 
@@ -393,16 +326,13 @@ function gradeFillBlank(q, rawStudentAnswer) {
  * left/right cùng chung 1 "id" trong q.pairs (không cần lưu riêng correct_option).
  * Học sinh nộp dạng object { [leftPairId]: rightPairId } — ghép leftPairId với
  * pairId nào. Điểm từng phần = số cặp ghép đúng / tổng số cặp.
- *
- * (GĐ3.6.8) Trả thêm `skipped` (true khi học sinh KHÔNG ghép cặp nào).
  */
 function gradeMatching(q, rawStudentAnswer) {
     const pairs = Array.isArray(q.pairs) ? q.pairs : [];
     const studentMap = (rawStudentAnswer && typeof rawStudentAnswer === 'object' && !Array.isArray(rawStudentAnswer))
         ? rawStudentAnswer : {};
-    const skipped = Object.keys(studentMap).length === 0;
 
-    if (pairs.length === 0) return { fraction: 0, studentAnswerNormalized: studentMap, correctAnswerForDetail: [], skipped };
+    if (pairs.length === 0) return { fraction: 0, studentAnswerNormalized: studentMap, correctAnswerForDetail: [] };
 
     let correctPairs = 0;
     pairs.forEach((pair) => {
@@ -413,57 +343,8 @@ function gradeMatching(q, rawStudentAnswer) {
     return {
         fraction: correctPairs / pairs.length,
         studentAnswerNormalized: studentMap,
-        correctAnswerForDetail: pairs.map((p) => ({ id: p.id, left: p.left, right: p.right })),
-        skipped
+        correctAnswerForDetail: pairs.map((p) => ({ id: p.id, left: p.left, right: p.right }))
     };
-}
-
-/** (GĐ3.6.9) { [id]: text } của mọi mục trong câu Sắp xếp (mục thiếu id bị bỏ qua, text thiếu -> ''). */
-function buildOrderingItemTexts(q) {
-    const texts = {};
-    (Array.isArray(q && q.items) ? q.items : []).forEach((it) => {
-        if (it && it.id !== undefined && it.id !== null) {
-            texts[it.id] = typeof it.text === 'string' ? it.text : '';
-        }
-    });
-    return texts;
-}
-
-/** (GĐ3.6.9) `order` có đúng là 1 hoán vị của `ids` không (cùng số phần tử, không trùng, không id lạ). */
-function isPermutationOfIds(order, ids) {
-    if (!Array.isArray(order) || !Array.isArray(ids) || order.length !== ids.length) return false;
-    const expected = new Set(ids.map((id) => String(id)));
-    const seen = new Set();
-    for (const id of order) {
-        const key = String(id);
-        if (!expected.has(key) || seen.has(key)) return false;
-        seen.add(key);
-    }
-    return seen.size === expected.size;
-}
-
-/**
- * GIĐ 3.6.9 — Dữ liệu "Xem lại" của câu Sắp xếp cho ketqua.js (tách từ route
- * /api/get-result-detail để test được). Nhận câu hỏi THẬT `q` (chưa xáo) và 1 phần tử `d` của
- * results.details (studentAnswer / correctAnswer là mảng id, xem gradeOrdering()). Trả về:
- *   items            : text các mục theo ĐÚNG thứ tự chuẩn
- *   studentPositions : với mỗi vị trí học sinh đã xếp, VỊ TRÍ CHUẨN của id đó (-1 nếu id lạ);
- *                      [] nếu học sinh bỏ qua.
- */
-function buildOrderingResultView(q, d) {
-    const correctIds = Array.isArray(d && d.correctAnswer) ? d.correctAnswer : [];
-    const textById = {};
-    (Array.isArray(q && q.items) ? q.items : []).forEach((it) => {
-        if (it && it.id !== undefined && it.id !== null) textById[it.id] = it.text;
-    });
-    const items = correctIds.map((id) => (typeof textById[id] === 'string' ? textById[id] : ''));
-
-    const positionById = {};
-    correctIds.forEach((id, pos) => { positionById[id] = pos; });
-    const studentIds = Array.isArray(d && d.studentAnswer) ? d.studentAnswer : [];
-    const studentPositions = studentIds.map((id) => (typeof positionById[id] === 'number' ? positionById[id] : -1));
-
-    return { items, studentPositions };
 }
 
 /**
@@ -477,11 +358,6 @@ function buildOrderingResultView(q, d) {
  * hẳn thiết kế cũ nơi VỊ TRÍ MẢNG "items" chính là đáp án. Dữ liệu cũ chưa
  * có "correctOrder" -> dự phòng bằng chính thứ tự mảng "items" như trước,
  * không phá câu hỏi đã tạo trước GĐ3.6.2.
- *
- * (GĐ3.6.8) Học sinh CHƯA sắp xếp (không gửi câu trả lời, hoặc gửi mảng rỗng)
- * -> `skipped: true`, studentAnswerNormalized = null (giống trắc nghiệm bỏ qua)
- * để phân biệt với "sắp SAI". Lam_bai.js chỉ gửi câu trả lời sau khi học sinh
- * thực sự đổi thứ tự.
  */
 function gradeOrdering(q, rawStudentAnswer) {
     const items = Array.isArray(q.items) ? q.items : [];
@@ -491,20 +367,7 @@ function gradeOrdering(q, rawStudentAnswer) {
         ? q.correctOrder
         : items.map((i) => i.id);
 
-    if (studentOrder.length === 0) {
-        return { fraction: 0, studentAnswerNormalized: null, correctAnswerForDetail: correctIds, skipped: true };
-    }
-
-    if (correctIds.length === 0) {
-        return { fraction: 0, studentAnswerNormalized: studentOrder, correctAnswerForDetail: [], skipped: false };
-    }
-
-    // (GĐ3.6.9) Câu trả lời PHẢI là hoán vị đúng của tập id đáp án (đủ mục, không trùng, không id
-    // lạ). Client thật luôn gửi đủ (lam_bai.js chỉ lưu sau khi đổi thứ tự và bỏ bản lưu hỏng);
-    // mảng thiếu/trùng/lạ chỉ đến từ việc sửa request -> 0 điểm, KHÔNG phải "bỏ qua".
-    if (!isPermutationOfIds(studentOrder, correctIds)) {
-        return { fraction: 0, studentAnswerNormalized: studentOrder, correctAnswerForDetail: correctIds, skipped: false };
-    }
+    if (correctIds.length === 0) return { fraction: 0, studentAnswerNormalized: studentOrder, correctAnswerForDetail: [] };
 
     let correctPositions = 0;
     correctIds.forEach((id, index) => {
@@ -514,8 +377,7 @@ function gradeOrdering(q, rawStudentAnswer) {
     return {
         fraction: correctPositions / correctIds.length,
         studentAnswerNormalized: studentOrder,
-        correctAnswerForDetail: correctIds,
-        skipped: false
+        correctAnswerForDetail: correctIds
     };
 }
 
@@ -544,10 +406,11 @@ function buildMatchingView(pairs, seed) {
  * (GĐ3.6.8 — FIX) Trước đây chỉ xáo rồi gửi, KHÔNG kiểm tra kết quả xáo có
  * tình cờ trùng đúng thứ tự đáp án hay không. Với câu ít mục điều này xảy ra
  * thường xuyên (đo thực tế, 20.000 seed: 2 mục ≈ 49,5%, 3 mục ≈ 16,3%, 4 mục
- * ≈ 4,1%). Giờ: nếu kết quả xáo trùng thứ tự đúng thì xoay 1 vị trí (xác
- * định, cùng seed luôn ra cùng kết quả -> F5 vẫn không đổi thứ tự). Với >= 2
- * mục, xoay 1 vị trí của một hoán vị trùng thứ tự đúng LUÔN cho ra thứ tự khác.
- * Nhờ vậy học sinh luôn PHẢI thao tác để có đáp án đúng.
+ * ≈ 4,1%). lam_bai.js lại tự lưu thứ tự đang hiển thị làm đáp án mặc định,
+ * nên học sinh KHÔNG đụng vào câu đó vẫn nộp đúng 100% và được trọn điểm.
+ * Giờ: nếu kết quả xáo trùng thứ tự đúng thì xoay 1 vị trí (xác định, cùng
+ * seed luôn ra cùng kết quả -> F5 vẫn không đổi thứ tự). Với >= 2 mục, xoay 1
+ * vị trí của một hoán vị trùng thứ tự đúng LUÔN cho ra thứ tự khác.
  *
  * `correctOrder` (tuỳ chọn): mảng id theo đúng thứ tự đáp án (GĐ3.6.2). Thiếu
  * thì dùng thứ tự mảng `items` gốc, đúng như gradeOrdering() đang dự phòng.
@@ -568,41 +431,6 @@ function buildOrderingView(items, seed, correctOrder) {
     }
 
     return view.map((it) => ({ id: it.id, text: it.text }));
-}
-
-/**
- * (GĐ3.7) Bản câu "Kéo-thả" gửi cho học sinh. Schema lưu trong Firestore:
- *   dragItems  : [{ id, text }]   — các thẻ kéo được (có thể có thẻ gây nhiễu, không thuộc ô nào)
- *   dropZones  : [{ id, label }]  — các ô thả
- *   correctMap : { [zoneId]: itemId } — ĐÁP ÁN, không bao giờ gửi xuống client
- * Thứ tự mảng dragItems do giáo viên nhập thường trùng thứ tự ô -> lộ đáp án nếu gửi nguyên,
- * nên xáo bằng seed cố định (F5 không đổi thứ tự) và, nếu thứ tự các thẻ ĐÚNG lại tình cờ
- * trùng thứ tự ô, xoay vòng cho tới khi khác đi (cùng cách buildOrderingView()).
- */
-function buildDragDropView(q, seed) {
-    const items = (Array.isArray(q && q.dragItems) ? q.dragItems : []).filter((it) => it && it.id !== undefined && it.id !== null);
-    const zones = (Array.isArray(q && q.dropZones) ? q.dropZones : []).filter((z) => z && z.id !== undefined && z.id !== null);
-    const map = (q && q.correctMap && typeof q.correctMap === 'object' && !Array.isArray(q.correctMap)) ? q.correctMap : {};
-
-    const mappedIdsInZoneOrder = zones.map((z) => map[z.id]).filter((id) => id !== undefined && id !== null).map(String);
-    const mappedSet = new Set(mappedIdsInZoneOrder);
-
-    let view = seededShuffle(items, `${seed}:drag`);
-
-    if (mappedIdsInZoneOrder.length > 1) {
-        const sameAsCorrect = (list) => {
-            const sub = list.filter((it) => mappedSet.has(String(it.id))).map((it) => String(it.id));
-            return sub.length === mappedIdsInZoneOrder.length && sub.every((id, i) => id === mappedIdsInZoneOrder[i]);
-        };
-        for (let i = 0; i < view.length && sameAsCorrect(view); i++) {
-            view = view.slice(1).concat(view[0]);
-        }
-    }
-
-    return {
-        dragItems: view.map((it) => ({ id: it.id, text: typeof it.text === 'string' ? it.text : '' })),
-        dropZones: zones.map((z) => ({ id: z.id, label: typeof z.label === 'string' ? z.label : '' }))
-    };
 }
 
 /**
@@ -673,12 +501,11 @@ function gradeSubmission(questions, safeAnswers) {
         // như nhánh trắc nghiệm bên dưới — PHẢI tách nhánh riêng ở đây, nếu không
         // sẽ rơi xuống nhánh "1 đáp án đúng dạng số" và luôn bị chấm SAI 100%
         // (đúng như cảnh báo audit GIĐ 3.1). Cho điểm TỪNG PHẦN theo tỉ lệ đúng.
-        if (canonicalType === 'fill_blank' || canonicalType === 'matching' || canonicalType === 'ordering' || canonicalType === 'drag_drop') {
+        if (canonicalType === 'fill_blank' || canonicalType === 'matching' || canonicalType === 'ordering') {
             const grader = canonicalType === 'fill_blank' ? gradeFillBlank
                 : canonicalType === 'matching' ? gradeMatching
-                : canonicalType === 'drag_drop' ? gradeDragDrop
                 : gradeOrdering;
-            const { fraction, studentAnswerNormalized, correctAnswerForDetail, skipped } = grader(q, safeAnswers[q.id]);
+            const { fraction, studentAnswerNormalized, correctAnswerForDetail } = grader(q, safeAnswers[q.id]);
             const earned = points * fraction;
             earnedPoints += earned;
             if (fraction === 1) correctCount += 1;
@@ -688,19 +515,10 @@ function gradeSubmission(questions, safeAnswers) {
                 studentAnswer: studentAnswerNormalized,
                 correctAnswer: correctAnswerForDetail,
                 isCorrect: fraction === 1,
-                // (GĐ3.6.8) true = học sinh không làm câu này (khác với làm SAI)
-                skipped: skipped === true,
                 partialFraction: fraction,
                 points,
                 earnedPoints: earned,
-                explanation: typeof q.explanation === 'string' ? q.explanation : '',
-                // (GĐ3.6.9) Câu Sắp xếp: details chỉ lưu MẢNG ID (ngẫu nhiên, vô nghĩa với giáo viên) nên
-                // lưu kèm {id: text} để màn Quản lý kết quả (quan-ly-ket-qua.js) hiện được nội dung
-                // thứ tự học sinh đã xếp. Không lộ thêm gì: correctAnswer (mảng id theo đúng thứ tự) đã có sẵn.
-                ...(canonicalType === 'ordering' ? { itemTexts: buildOrderingItemTexts(q) } : {}),
-                // (GĐ3.7B) Câu Kéo-thả: details chỉ lưu id ngẫu nhiên nên lưu kèm ảnh chụp chữ của ô/thẻ lúc chấm
-                // (cho màn Xem lại + màn Quản lý kết quả); giáo viên sửa câu về sau không làm lệch bài đã nộp.
-                ...(canonicalType === 'drag_drop' ? { dragTexts: buildDragDropTexts(q) } : {})
+                explanation: typeof q.explanation === 'string' ? q.explanation : ''
             });
             return; // đã xử lý xong câu này, bỏ qua toàn bộ nhánh trắc nghiệm bên dưới
         }
@@ -752,12 +570,6 @@ function gradeSubmission(questions, safeAnswers) {
     });
 
     const totalQuestions = questions.length;
-    // (GĐ3.6.8) Thống kê tách bạch: Đúng / Bỏ qua (chưa trả lời) / Sai. Câu chấm
-    // tay (manualItems) không nằm trong details nên không tính vào 3 số này.
-    const skippedCount = details.filter(
-        (d) => d.skipped === true || d.studentAnswer === null || d.studentAnswer === undefined
-    ).length;
-    const incorrectCount = Math.max(0, details.length - correctCount - skippedCount);
     // Có câu chấm tay -> CHƯA có điểm chính thức (score = null,
     // gradingStatus = 'pending') cho tới khi giáo viên chấm qua /api/grade-result.
     // autoScore chỉ là điểm riêng của phần trắc nghiệm, để giáo viên tham khảo.
@@ -768,8 +580,6 @@ function gradeSubmission(questions, safeAnswers) {
 
     return {
         correctCount,
-        skippedCount,
-        incorrectCount,
         earnedPoints,
         totalPoints,
         details,
@@ -799,12 +609,7 @@ module.exports = {
     gradeFillBlank,
     gradeMatching,
     gradeOrdering,
-    buildOrderingResultView,
     buildMatchingView,
     buildOrderingView,
-    buildDragDropView,
-    gradeDragDrop,
-    buildDragDropResultView,
-    buildDragDropTexts,
     translateMatchingAnswer
 };

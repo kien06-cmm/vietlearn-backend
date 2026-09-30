@@ -23,7 +23,10 @@ const {
     seededShuffle,
     gradeSubmission,
     normalizeQuestionType,
-    translateMatchingAnswer
+    translateMatchingAnswer,
+    toReviewQuestionServer,
+    buildOrderingResultView,
+    buildDragDropResultView
 } = require('./lib/grading');
 
 /**
@@ -817,6 +820,8 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
         // tests/grading.test.js) và để chỉ có DUY NHẤT 1 bản logic chấm điểm.
         const {
             correctCount,
+            skippedCount,
+            incorrectCount,
             details,
             manualItems,
             totalQuestions,
@@ -937,6 +942,11 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
             // score = null khi bài đang chờ chấm -> Frontend phải hiện "Chờ chấm", không toFixed().
             responsePayload.score = score;
             responsePayload.correctCount = correctCount;
+            // (GĐ3.6.8) Đúng / Bỏ qua / Sai do SERVER tính (gradeSubmission) — client không tự suy
+            // ra từ số câu đã có trong state.answers nữa, nếu không câu Sắp xếp/Điền chỗ trống/Ghép
+            // đôi học sinh chưa làm (hoặc câu chấm tay) dễ bị đếm lệch giữa "Bỏ qua" và "Sai".
+            responsePayload.skippedCount = skippedCount;
+            responsePayload.incorrectCount = incorrectCount;
             responsePayload.totalQuestions = totalQuestions;
         }
 
@@ -945,7 +955,9 @@ app.post('/api/submit-exam', verifyFirebaseToken, async (req, res) => {
                 const filtered = {
                     questionId: item.questionId,
                     studentAnswer: item.studentAnswer,
-                    isCorrect: item.isCorrect
+                    isCorrect: item.isCorrect,
+                    // (GĐ3.6.8) phân biệt "Bỏ qua" với "Sai" — cùng quy tắc với skippedCount trong gradeSubmission()
+                    skipped: item.skipped === true || item.studentAnswer === null || item.studentAnswer === undefined
                 };
                 if (examData.showCorrectAnswers === true) {
                     filtered.correctAnswer = item.correctAnswer;
@@ -1110,8 +1122,11 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
         const fullDetails = Array.isArray(resultData.details) ? resultData.details : [];
         const totalQuestions = Number(resultData.totalQuestions) || fullDetails.length;
         const correctCount = Number(resultData.correctCount) || 0;
+        // (GĐ3.6.8) `d.skipped === true`: câu Sắp xếp / Điền chỗ trống / Ghép đôi mà học
+        // sinh không làm (studentAnswer không phải null nên phải dựa vào cờ này) — tính là
+        // "Bỏ qua", KHÔNG được tính vào "Sai".
         const skippedCount = fullDetails.filter(
-            (d) => d.studentAnswer === null || d.studentAnswer === undefined
+            (d) => d.skipped === true || d.studentAnswer === null || d.studentAnswer === undefined
         ).length;
         // GIAI ĐOẠN 4.3: câu Tự luận / Upload không nằm trong details nên không được tính là "sai".
         const manualCount = Array.isArray(resultData.manualItems) ? resultData.manualItems.length : 0;
@@ -1192,7 +1207,10 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
                         : (typeof d.studentAnswer === 'number' ? d.studentAnswer : null),
                     correctAnswer: Array.isArray(d.correctAnswer) ? d.correctAnswer
                         : (typeof d.correctAnswer === 'number' ? d.correctAnswer : -1),
-                    isCorrect: d.isCorrect === true
+                    isCorrect: d.isCorrect === true,
+                    // (GĐ3.6.8) true = học sinh không làm câu này (khác với làm SAI) — ketqua.js
+                    // dựa vào cờ này để hiện "Bỏ qua" thay vì "Sai" cho câu Sắp xếp/Điền chỗ trống/Ghép đôi.
+                    skipped: d.skipped === true
                 };
                 // GĐ3.3 (FIX): câu "Điền vào chỗ trống" không dùng options/correctAnswer
                 // kiểu chỉ số như trắc nghiệm — ketqua.js (evaluateFillBlankQuestion)
@@ -1250,21 +1268,22 @@ app.post('/api/get-result-detail', verifyFirebaseToken, async (req, res) => {
                 //     đó trong correctIds, để evaluateOrdering() so "order[i] === i" ra
                 //     đúng/sai từng vị trí (giống cách renderMatchingQuestionCard() đã làm
                 //     cho câu Ghép đôi ở trên).
+                // (GĐ3.6.9) logic dịch id -> text/chỉ số đã tách sang buildOrderingResultView()
+                // trong lib/grading.js để có test (tests/ordering.test.js).
                 if (canonicalType === 'ordering' && Array.isArray(d.correctAnswer)) {
-                    const correctIds = d.correctAnswer;
-                    const textById = {};
-                    (Array.isArray(q.items) ? q.items : []).forEach((it) => {
-                        if (it && it.id !== undefined && it.id !== null) textById[it.id] = it.text;
-                    });
-                    item.items = correctIds.map((id) => (textById[id] !== undefined ? textById[id] : ''));
-
-                    const positionById = {};
-                    correctIds.forEach((id, pos) => { positionById[id] = pos; });
-                    const studentOrderIds = Array.isArray(d.studentAnswer) ? d.studentAnswer : [];
-                    item.studentPositions = studentOrderIds.map((id) => {
-                        const pos = positionById[id];
-                        return typeof pos === 'number' ? pos : -1;
-                    });
+                    const orderingView = buildOrderingResultView(q, d);
+                    item.items = orderingView.items;
+                    item.studentPositions = orderingView.studentPositions;
+                }
+                // (GĐ3.7B) Câu "Kéo-thả": details lưu correctAnswer = [{ zoneId, itemId }] và studentAnswer = { [zoneId]: itemId }
+                // (id ngẫu nhiên, vô nghĩa với học sinh) kèm d.dragTexts (ảnh chụp chữ lúc chấm). ketqua.js cần
+                // item.zones = [{ label, correctText, studentText, placed, isCorrect }] + item.distractors = [text]
+                // để vẽ bảng đối chiếu — dựng bằng buildDragDropResultView() (lib/dragdrop.js, có test).
+                // Chỉ nằm trong nhánh questionsVisible nên không lộ đáp án khi giáo viên tắt "Hiện đáp án".
+                if (canonicalType === 'drag_drop' && Array.isArray(d.correctAnswer)) {
+                    const dragDropView = buildDragDropResultView(q, d);
+                    item.zones = dragDropView.zones;
+                    item.distractors = dragDropView.distractors;
                 }
                 if (explanationVisible) {
                     item.explanation = typeof d.explanation === 'string' ? d.explanation : '';
@@ -1524,37 +1543,8 @@ async function checkReviewDownloadAccess(examId, examData, studentId) {
     return { ok: true };
 }
 
-/**
- * Chuẩn hoá 1 câu hỏi về dạng gọn cho file ôn tập, hỗ trợ cả 2 schema
- * (answers[{text,correct}] và options[]+correctAnswer) — cùng cách
- * getCorrectIndexServer/getOptionTextsServer đang làm. Khác getCorrectIndexServer
- * ở chỗ trả về MỌI đáp án đúng (câu "nhiều đáp án").
- */
-function toReviewQuestionServer(q, includeExplanation) {
-    const type = typeof q.type === 'string' ? q.type : 'multiple_choice';
-
-    // GĐ2: dùng chung getCorrectIndicesServer() — hỗ trợ CẢ correct_option
-    // (schema mới, number | number[]) LẪN answers[].correct/correctAnswer
-    // (schema cũ). Trước đây hàm này tự viết lại logic riêng và BỎ SÓT
-    // correct_option -> câu hỏi tạo theo schema mới bị hiện SAI đáp án
-    // đúng (luôn rỗng) trong file ôn tập tải về.
-    const correctIndexes = getCorrectIndicesServer(q);
-
-    return {
-        id: q.id,
-        type,
-        text: q.question_text || q.question || q.text || '',
-        options: type === 'essay' ? [] : getOptionTextsServer(q),
-        correctIndexes,
-        essayAnswer: (type === 'essay' && typeof q.essayAnswer === 'string') ? q.essayAnswer : '',
-        explanation: (includeExplanation && typeof q.explanation === 'string') ? q.explanation : '',
-        // "image_url" (schema mới) ưu tiên, vẫn đọc "image" (schema cũ) để
-        // không vỡ dữ liệu chưa migrate — khớp cách sanitizeQuestionForClient() làm.
-        image: typeof q.image_url === 'string' && q.image_url ? q.image_url
-            : (typeof q.image === 'string' ? q.image : ''),
-        score: Number(q.score) > 0 ? Number(q.score) : 1
-    };
-}
+// (GĐ3.6.8) toReviewQuestionServer() đã chuyển sang lib/grading.js (import ở đầu file)
+// để dùng CHUNG 1 bản + test được, và hỗ trợ thêm câu "Sắp xếp" (orderedItems).
 
 app.post('/api/get-review-material', verifyFirebaseToken, async (req, res) => {
     try {

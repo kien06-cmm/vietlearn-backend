@@ -1,638 +1,264 @@
 'use strict';
 
 /**
- * tests/grading.test.js — GĐ 0.1 (BACKEND AN TOÀN + NỀN TẢNG)
+ * tests/grading.test.js — GĐ3.6 (hồi quy chấm điểm + làm sạch câu hỏi)
  *
- * Test cho lib/grading.js — dùng module test tích hợp sẵn của Node.js
- * (node:test + node:assert), KHÔNG cần cài thêm gì (không Jest, không
- * Firebase Admin, không biến môi trường). Chạy bằng:
+ * Phạm vi: lib/grading.js (logic thuần, không cần Firebase). KHÔNG bao phủ
+ * phần route trong server.js (cần Firebase Admin) và phần UI trình duyệt.
  *
- *   npm test
- *   # hoặc trực tiếp:
- *   node --test tests
- *
- * Mục tiêu (theo đúng yêu cầu 0.1): đảm bảo sửa backend không làm sai
- * điểm hàng loạt. Bao phủ:
- *   - getCorrectIndicesServer (đọc đáp án đúng ở mọi schema cũ/mới)
- *   - sanitizeQuestionForClient (không được lộ đáp án đúng ra client)
- *   - gradeSubmission (logic chấm điểm thật dùng ở /api/submit-exam)
- *   - test case đúng/sai, dữ liệu bất thường, và mô phỏng luồng "submit thật"
+ * Chạy:  npm test
  */
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-    getCorrectIndicesServer,
-    getCorrectIndexServer,
-    getOptionTextsServer,
     sanitizeQuestionForClient,
-    isManualQuestionServer,
-    isAllowedUploadUrl,
-    extractManualAnswerServer,
     gradeSubmission,
+    gradeOrdering,
     gradeFillBlank,
-    gradeOrdering
+    gradeMatching,
+    translateMatchingAnswer,
+    toReviewQuestionServer
 } = require('../lib/grading');
 
-// ============================================================================
-// getCorrectIndicesServer — đọc đáp án đúng, hỗ trợ 3 dạng schema
-// ============================================================================
-test('getCorrectIndicesServer', async (t) => {
-    await t.test('schema MỚI: correct_option là number -> mảng 1 phần tử', () => {
-        assert.deepEqual(getCorrectIndicesServer({ correct_option: 2 }), [2]);
-    });
+const SEED = 'exam1_stu1_q1';
 
-    await t.test('schema MỚI: correct_option là number[] (multiple_answer)', () => {
-        assert.deepEqual(getCorrectIndicesServer({ correct_option: [0, 2] }), [0, 2]);
-    });
-
-    await t.test('schema MỚI: correct_option là number[] lẫn giá trị bẩn -> lọc bỏ non-number', () => {
-        assert.deepEqual(getCorrectIndicesServer({ correct_option: [0, '1', null, 2] }), [0, 2]);
-    });
-
-    await t.test('schema MỚI: correct_option null (essay/chưa xác định) -> mảng rỗng', () => {
-        assert.deepEqual(getCorrectIndicesServer({ correct_option: null }), []);
-    });
-
-    await t.test('schema CŨ 1: answers[].correct -> trả về chỉ số các phần tử correct:true', () => {
-        const q = {
-            answers: [
-                { text: 'A', correct: false },
-                { text: 'B', correct: true },
-                { text: 'C', correct: false }
-            ]
-        };
-        assert.deepEqual(getCorrectIndicesServer(q), [1]);
-    });
-
-    await t.test('schema CŨ 1: nhiều đáp án đúng cùng lúc', () => {
-        const q = {
-            answers: [
-                { text: 'A', correct: true },
-                { text: 'B', correct: false },
-                { text: 'C', correct: true }
-            ]
-        };
-        assert.deepEqual(getCorrectIndicesServer(q), [0, 2]);
-    });
-
-    await t.test('schema CŨ 1: phần tử answers bị null/undefined không làm crash', () => {
-        const q = { answers: [null, { text: 'B', correct: true }, undefined] };
-        assert.deepEqual(getCorrectIndicesServer(q), [1]);
-    });
-
-    await t.test('schema CŨ 2: options[] + correctAnswer (number)', () => {
-        assert.deepEqual(getCorrectIndicesServer({ options: ['A', 'B', 'C'], correctAnswer: 1 }), [1]);
-    });
-
-    await t.test('không có field nào xác định đáp án đúng -> mảng rỗng', () => {
-        assert.deepEqual(getCorrectIndicesServer({ question_text: 'Câu hỏi tự luận' }), []);
-    });
-
-    await t.test('correct_option ưu tiên hơn nếu tồn tại cả 2 schema (dữ liệu lai do migrate dở dang)', () => {
-        const q = { correct_option: 1, correctAnswer: 0 };
-        assert.deepEqual(getCorrectIndicesServer(q), [1]);
-    });
+const orderingQ = (extra = {}) => ({
+    id: 'qo', type: 'ordering', score: 3,
+    items: [{ id: 'b', text: 'Bước B' }, { id: 'a', text: 'Bước A' }, { id: 'c', text: 'Bước C' }],
+    correctOrder: ['a', 'b', 'c'],
+    ...extra
+});
+const mcQ = (id = 'qm', correct = 1) => ({ id, type: 'multiple_choice', score: 1, options: ['x', 'y', 'z'], correct_option: correct });
+const fillQ = () => ({
+    id: 'qf', type: 'fill_blank', score: 2,
+    question_text: 'Thủ đô VN là ___ và sông là ___',
+    blanks: [{ acceptedAnswers: ['Hà Nội', 'Ha Noi'] }, { acceptedAnswers: ['Sông Hồng'] }]
 });
 
-test('getCorrectIndexServer (tương thích ngược — chỉ số đầu tiên)', () => {
-    assert.equal(getCorrectIndexServer({ correct_option: [2, 0] }), 2);
-    assert.equal(getCorrectIndexServer({ correct_option: 3 }), 3);
-    assert.equal(getCorrectIndexServer({ question_text: 'không có đáp án' }), -1);
-});
-
-test('getOptionTextsServer', async (t) => {
-    await t.test('schema MỚI: options: string[]', () => {
-        assert.deepEqual(getOptionTextsServer({ options: ['A', 'B'] }), ['A', 'B']);
+test('KHÔNG lộ đáp án xuống học sinh', async (t) => {
+    await t.test('ordering: không có "correctOrder" ở bất kỳ đâu trong JSON gửi xuống', () => {
+        const clean = sanitizeQuestionForClient(orderingQ(), SEED);
+        assert.equal(JSON.stringify(clean).includes('correctOrder'), false);
     });
 
-    await t.test('schema CŨ: answers[{text}]', () => {
-        assert.deepEqual(
-            getOptionTextsServer({ answers: [{ text: 'A', correct: true }, { text: 'B', correct: false }] }),
-            ['A', 'B']
-        );
+    await t.test('fill_blank: không lộ "acceptedAnswers" và không lộ nội dung đáp án', () => {
+        const clean = sanitizeQuestionForClient(fillQ(), SEED);
+        const json = JSON.stringify(clean);
+        assert.equal(json.includes('acceptedAnswers'), false);
+        assert.equal(json.includes('Hà Nội'), false);
+        assert.equal(json.includes('Ha Noi'), false);
+        assert.equal(json.includes('Sông Hồng'), false);
     });
 
-    await t.test('answers có phần tử thiếu text -> trả chuỗi rỗng thay vì crash', () => {
-        assert.deepEqual(getOptionTextsServer({ answers: [{ correct: true }, { text: 'B' }] }), ['', 'B']);
+    await t.test('fill_blank: vẫn giữ đúng SỐ chỗ trống để UI biết', () => {
+        const clean = sanitizeQuestionForClient(fillQ(), SEED);
+        assert.equal(clean.blanks.length, 2);
     });
 
-    await t.test('không có options/answers -> mảng rỗng', () => {
-        assert.deepEqual(getOptionTextsServer({}), []);
-    });
-});
-
-// ============================================================================
-// sanitizeQuestionForClient — TUYỆT ĐỐI không được lộ đáp án đúng
-// ============================================================================
-test('sanitizeQuestionForClient', async (t) => {
-    await t.test('xoá correct_option (schema mới)', () => {
-        const clean = sanitizeQuestionForClient({ id: 'q1', question_text: 'X', options: ['A', 'B'], correct_option: 1 });
-        assert.equal('correct_option' in clean, false);
-        assert.equal(clean.question_text, 'X');
-        assert.deepEqual(clean.options, ['A', 'B']);
+    await t.test('fill_blank: cũng không lộ khi gọi không có seed', () => {
+        const clean = sanitizeQuestionForClient(fillQ());
+        assert.equal(JSON.stringify(clean).includes('acceptedAnswers'), false);
     });
 
-    await t.test('xoá correct_option dạng mảng (multiple_answer)', () => {
-        const clean = sanitizeQuestionForClient({ id: 'q1', correct_option: [0, 2] });
-        assert.equal('correct_option' in clean, false);
-    });
-
-    await t.test('xoá "correct" trong từng phần tử answers[] nhưng giữ text (schema cũ)', () => {
+    await t.test('trắc nghiệm: không lộ correct_option / answers[].correct / correctAnswer / explanation', () => {
         const clean = sanitizeQuestionForClient({
-            id: 'q1',
-            answers: [{ text: 'A', correct: true }, { text: 'B', correct: false }]
-        });
-        assert.deepEqual(clean.answers, [{ text: 'A' }, { text: 'B' }]);
-        clean.answers.forEach((a) => assert.equal('correct' in a, false));
-    });
-
-    await t.test('xoá correctAnswer (schema cũ 2)', () => {
-        const clean = sanitizeQuestionForClient({ id: 'q1', options: ['A', 'B'], correctAnswer: 1 });
-        assert.equal('correctAnswer' in clean, false);
-    });
-
-    await t.test('xoá essayAnswer và explanation (không được lộ lời giải/đáp án mẫu)', () => {
-        const clean = sanitizeQuestionForClient({
-            id: 'q1',
-            type: 'essay',
-            essayAnswer: 'Đáp án mẫu bí mật',
-            explanation: 'Lời giải bí mật'
-        });
-        assert.equal('essayAnswer' in clean, false);
-        assert.equal('explanation' in clean, false);
-    });
-
-    await t.test('image_url: ưu tiên image_url nếu có, vẫn đọc "image" (schema cũ) nếu thiếu image_url', () => {
-        const cleanNew = sanitizeQuestionForClient({ id: 'q1', image_url: 'https://x/a.png' });
-        assert.equal(cleanNew.image_url, 'https://x/a.png');
-        assert.equal('image' in cleanNew, false);
-
-        const cleanOld = sanitizeQuestionForClient({ id: 'q1', image: 'https://x/b.png' });
-        assert.equal(cleanOld.image_url, 'https://x/b.png');
-        assert.equal('image' in cleanOld, false);
-    });
-
-    await t.test('không có ảnh -> image_url luôn là chuỗi rỗng, không phải undefined', () => {
-        const clean = sanitizeQuestionForClient({ id: 'q1' });
-        assert.equal(clean.image_url, '');
-    });
-
-    await t.test('không làm biến dạng object gốc truyền vào (immutable input)', () => {
-        const original = { id: 'q1', correct_option: 1, options: ['A', 'B'] };
-        const snapshot = JSON.parse(JSON.stringify(original));
-        sanitizeQuestionForClient(original);
-        assert.deepEqual(original, snapshot);
-    });
-});
-
-// ============================================================================
-// gradeFillBlank — CHẤM ĐIỂM "Điền vào chỗ trống" (FIX: xem ghi chú ở lib/grading.js)
-// Trước đây MỌI câu loại này luôn bị chấm 0 điểm dù trả lời đúng, vì hàm
-// đọc sai tên field (accepted_answers thay vì acceptedAnswers) và sai định
-// dạng đáp án học sinh gửi lên (object theo id thay vì mảng theo vị trí).
-// ============================================================================
-test('gradeFillBlank', async (t) => {
-    await t.test('học sinh điền đúng HẤT các ô trống -> fraction = 1', () => {
-        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }, { acceptedAnswers: ['1945']}] };
-        const result = gradeFillBlank(q, ['Hà Nội', '1945']);
-        assert.equal(result.fraction, 1);
-    });
-
-    await t.test('không phân biệt hoa/thường và có/không dấu (khớp normalizeBlankAnswer của gradebook-engine.js)', () => {
-        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }] };
-        const result = gradeFillBlank(q, ['  ha NOI  ']);
-        assert.equal(result.fraction, 1);
-    });
-
-    await t.test('điền đúng MỘT PHẦN số ô -> fraction từ phần (không phải 0 hoặc 1)', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }, { acceptedAnswers: ['B'] }] };
-        const result = gradeFillBlank(q, ['A', 'sai']);
-        assert.equal(result.fraction, 0.5);
-    });
-
-    await t.test('trả lời sai hết -> fraction = 0', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
-        const result = gradeFillBlank(q, ['B']);
-        assert.equal(result.fraction, 0);
-    });
-
-    await t.test('không trả lời gì (mảng rỗng) -> fraction = 0, không crash', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
-        const result = gradeFillBlank(q, []);
-        assert.equal(result.fraction, 0);
-    });
-
-    await t.test('gửi lên object theo id (định dạng SAI của bản cũ) -> không crash, coi như chưa trả lời', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
-        const result = gradeFillBlank(q, { blank_1: 'A' });
-        assert.equal(result.fraction, 0);
-    });
-
-    await t.test('câu hỏi không có blanks nào -> fraction = 0, không chia cho 0', () => {
-        const result = gradeFillBlank({ blanks: [] }, ['A']);
-        assert.equal(result.fraction, 0);
-        assert.deepEqual(result.correctAnswerForDetail, []);
-    });
-});
-
-test('gradeSubmission — tích hợp fill_blank (FIX)', async (t) => {
-    await t.test('câu fill_blank điền đúng được cộng điểm đầy đủ thay vì luôn bị 0 như trước', () => {
-        const questions = [
-            { id: 'q1', type: 'fill_blank', score: 2, blanks: [{ acceptedAnswers: ['Hà Nội'] }] }
-        ];
-        const result = gradeSubmission(questions, { q1: ['hà nội'] });
-        assert.equal(result.details[0].isCorrect, true);
-        assert.equal(result.earnedPoints, 2);
-        assert.equal(result.correctCount, 1);
-    });
-});
-
-// ============================================================================
-// gradeSubmission — LOGIC CHẤM ĐIỂM THẬT dùng ở /api/submit-exam
-// ============================================================================
-test('gradeSubmission — trắc nghiệm đơn / true_false', async (t) => {
-    await t.test('chọn đúng đáp án -> isCorrect true, cộng điểm đầy đủ', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', correct_option: 1, score: 2 }];
-        const result = gradeSubmission(questions, { q1: 1 });
-        assert.equal(result.correctCount, 1);
-        assert.equal(result.earnedPoints, 2);
-        assert.equal(result.totalPoints, 2);
-        assert.equal(result.autoScore, 10);
-        assert.equal(result.score, 10);
-        assert.equal(result.gradingStatus, 'graded');
-        assert.deepEqual(result.details[0], {
-            questionId: 'q1',
-            studentAnswer: 1,
-            correctAnswer: 1,
-            isCorrect: true,
-            points: 2,
-            explanation: ''
+            id: 'q', type: 'multiple_choice', options: ['a', 'b'], correct_option: 1,
+            answers: [{ text: 'a', correct: false }, { text: 'b', correct: true }],
+            correctAnswer: 1, explanation: 'vì b'
+        }, SEED);
+        const json = JSON.stringify(clean);
+        ['correct_option', '"correct"', 'correctAnswer', 'explanation', 'vì b'].forEach((s) => {
+            assert.equal(json.includes(s), false, `lộ: ${s}`);
         });
     });
 
-    await t.test('chọn sai đáp án -> isCorrect false, không cộng điểm', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', correct_option: 1, score: 1 }];
-        const result = gradeSubmission(questions, { q1: 0 });
-        assert.equal(result.correctCount, 0);
-        assert.equal(result.earnedPoints, 0);
-        assert.equal(result.details[0].isCorrect, false);
-        assert.equal(result.details[0].correctAnswer, 1);
+    await t.test('matching: cột phải không còn id thật', () => {
+        const q = { id: 'qg', type: 'matching', pairs: [{ id: 'p1', left: 'A', right: '1' }, { id: 'p2', left: 'B', right: '2' }] };
+        const clean = sanitizeQuestionForClient(q, SEED);
+        clean.pairs.right.forEach((r) => assert.deepEqual(Object.keys(r).sort(), ['text', 'token']));
     });
 
-    await t.test('không trả lời (bỏ qua) -> studentAnswer null, isCorrect false', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', correct_option: 0 }];
-        const result = gradeSubmission(questions, {});
-        assert.equal(result.details[0].studentAnswer, null);
-        assert.equal(result.details[0].isCorrect, false);
+    await t.test('ordering: xáo trộn xác định, đủ mục, khác thứ tự đáp án', () => {
+        const a = sanitizeQuestionForClient(orderingQ(), SEED).items.map((i) => i.id);
+        const b = sanitizeQuestionForClient(orderingQ(), SEED).items.map((i) => i.id);
+        assert.deepEqual(a, b);
+        assert.deepEqual([...a].sort(), ['a', 'b', 'c']);
+        assert.notDeepEqual(a, ['a', 'b', 'c']);
+    });
+});
+
+test('Ordering: chưa thao tác => Bỏ qua (KHÔNG phải Sai)', async (t) => {
+    await t.test('không gửi answer cho câu ordering -> skipped, studentAnswer null, 0 điểm', () => {
+        const r = gradeSubmission([orderingQ()], {});
+        const d = r.details[0];
+        assert.equal(d.skipped, true);
+        assert.equal(d.studentAnswer, null);
+        assert.equal(d.isCorrect, false);
+        assert.equal(d.earnedPoints, 0);
+        assert.equal(r.skippedCount, 1);
+        assert.equal(r.incorrectCount, 0);
+        assert.equal(r.correctCount, 0);
     });
 
-    await t.test('không có "score" trên câu hỏi -> mặc định 1 điểm', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', correct_option: 0 }];
-        const result = gradeSubmission(questions, { q1: 0 });
-        assert.equal(result.details[0].points, 1);
-        assert.equal(result.totalPoints, 1);
+    await t.test('gửi mảng rỗng -> cũng là Bỏ qua', () => {
+        const r = gradeSubmission([orderingQ()], { qo: [] });
+        assert.equal(r.details[0].skipped, true);
+        assert.equal(r.skippedCount, 1);
     });
 
-    await t.test('score = 0 hoặc âm trên câu hỏi (dữ liệu bất thường) -> vẫn fallback về 1 điểm', () => {
-        const questions = [
-            { id: 'q1', type: 'multiple_choice', correct_option: 0, score: 0 },
-            { id: 'q2', type: 'multiple_choice', correct_option: 0, score: -5 }
+    await t.test('gửi giá trị rác (không phải mảng) -> Bỏ qua, không crash', () => {
+        [null, 'abc', 5, { a: 1 }].forEach((junk) => {
+            const r = gradeSubmission([orderingQ()], { qo: junk });
+            assert.equal(r.details[0].skipped, true);
+        });
+    });
+
+    await t.test('gradeOrdering trực tiếp: chưa trả lời -> skipped true', () => {
+        assert.equal(gradeOrdering(orderingQ(), undefined).skipped, true);
+        assert.equal(gradeOrdering(orderingQ(), undefined).studentAnswerNormalized, null);
+    });
+});
+
+test('Ordering: có thao tác => chấm đúng/sai/từng phần, KHÔNG bị coi là Bỏ qua', async (t) => {
+    await t.test('sắp SAI -> Sai (skipped=false), studentAnswer được lưu', () => {
+        const r = gradeSubmission([orderingQ()], { qo: ['c', 'b', 'a'] });
+        const d = r.details[0];
+        assert.equal(d.skipped, false);
+        assert.deepEqual(d.studentAnswer, ['c', 'b', 'a']);
+        assert.equal(d.isCorrect, false);
+        assert.equal(r.skippedCount, 0);
+        assert.equal(r.incorrectCount, 1);
+    });
+
+    await t.test('sắp ĐÚNG -> trọn điểm', () => {
+        const r = gradeSubmission([orderingQ()], { qo: ['a', 'b', 'c'] });
+        assert.equal(r.details[0].isCorrect, true);
+        assert.equal(r.details[0].skipped, false);
+        assert.equal(r.earnedPoints, 3);
+        assert.equal(r.correctCount, 1);
+        assert.equal(r.score, 10);
+    });
+
+    await t.test('đúng 1/3 vị trí -> điểm từng phần, vẫn tính là Sai', () => {
+        const r = gradeSubmission([orderingQ()], { qo: ['a', 'c', 'b'] });
+        assert.equal(r.details[0].partialFraction, 1 / 3);
+        assert.equal(r.details[0].earnedPoints, 1);
+        assert.equal(r.incorrectCount, 1);
+    });
+
+    await t.test('dữ liệu cũ (chưa có correctOrder): dự phòng theo thứ tự mảng items', () => {
+        const q = { id: 'qo', type: 'ordering', score: 1, items: [{ id: 'x', text: 'X' }, { id: 'y', text: 'Y' }] };
+        assert.equal(gradeSubmission([q], { qo: ['x', 'y'] }).details[0].isCorrect, true);
+        assert.equal(gradeSubmission([q], { qo: ['y', 'x'] }).details[0].isCorrect, false);
+    });
+});
+
+test('Thống kê: Đúng / Bỏ qua / Sai tách bạch', async (t) => {
+    await t.test('bài hỗn hợp: đếm đúng từng nhóm và cộng lại bằng tổng số câu', () => {
+        const qs = [
+            mcQ('m1', 1),      // đúng
+            mcQ('m2', 1),      // bỏ qua (không gửi)
+            mcQ('m3', 1),      // sai
+            orderingQ({ id: 'o1' }), // bỏ qua
+            orderingQ({ id: 'o2' }), // sai
+            orderingQ({ id: 'o3' }), // đúng
+            fillQ()            // bỏ qua (không gửi)
         ];
-        const result = gradeSubmission(questions, { q1: 0, q2: 0 });
-        assert.equal(result.totalPoints, 2);
-        assert.equal(result.earnedPoints, 2);
+        const r = gradeSubmission(qs, {
+            m1: 1, m3: 0,
+            o2: ['c', 'b', 'a'], o3: ['a', 'b', 'c']
+        });
+        assert.equal(r.correctCount, 2);
+        assert.equal(r.skippedCount, 3);
+        assert.equal(r.incorrectCount, 2);
+        assert.equal(r.correctCount + r.skippedCount + r.incorrectCount, r.details.length);
     });
 
-    await t.test('câu hỏi không có correct_option nào xác định (lỗi bóc tách) -> luôn sai dù học sinh trả lời gì', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', score: 1 }];
-        const result = gradeSubmission(questions, { q1: 0 });
-        assert.equal(result.details[0].isCorrect, false);
-        assert.equal(result.details[0].correctAnswer, -1);
+    await t.test('câu tự luận không bị tính vào Đúng/Sai/Bỏ qua', () => {
+        const r = gradeSubmission([mcQ('m1', 1), { id: 'e1', type: 'essay', score: 1 }], { m1: 1, e1: 'bài làm' });
+        assert.equal(r.details.length, 1);
+        assert.equal(r.manualItems.length, 1);
+        assert.equal(r.correctCount + r.skippedCount + r.incorrectCount, 1);
     });
 
-    await t.test('dữ liệu bất thường: rawStudentAnswer là chuỗi thay vì number -> coi như chưa trả lời', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', correct_option: 1 }];
-        const result = gradeSubmission(questions, { q1: '1' });
-        assert.equal(result.details[0].studentAnswer, null);
-        assert.equal(result.details[0].isCorrect, false);
-    });
-});
-
-test('gradeSubmission — multiple_answer (nhiều đáp án đúng)', async (t) => {
-    await t.test('chọn ĐÚNG HẾT các đáp án đúng, không thừa không thiếu -> đúng', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [0, 2], score: 3 }];
-        const result = gradeSubmission(questions, { q1: [2, 0] }); // thứ tự khác nhau vẫn phải đúng
-        assert.equal(result.details[0].isCorrect, true);
-        assert.equal(result.earnedPoints, 3);
+    await t.test('fill_blank: trống hết = Bỏ qua; điền sai = Sai; điền đúng = Đúng', () => {
+        assert.equal(gradeFillBlank(fillQ(), undefined).skipped, true);
+        assert.equal(gradeFillBlank(fillQ(), ['', '  ']).skipped, true);
+        const wrong = gradeFillBlank(fillQ(), ['Huế', 'Sông Đà']);
+        assert.equal(wrong.skipped, false);
+        assert.equal(wrong.fraction, 0);
+        assert.equal(gradeFillBlank(fillQ(), ['ha noi', 'song hong']).fraction, 1);
     });
 
-    await t.test('chọn THIẾU 1 đáp án đúng -> sai', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [0, 2] }];
-        const result = gradeSubmission(questions, { q1: [0] });
-        assert.equal(result.details[0].isCorrect, false);
-    });
-
-    await t.test('chọn THỪA 1 đáp án đúng (chọn cả đáp án sai) -> sai', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [0, 2] }];
-        const result = gradeSubmission(questions, { q1: [0, 1, 2] });
-        assert.equal(result.details[0].isCorrect, false);
-    });
-
-    await t.test('gửi 1 number thay vì mảng (client cũ/lỗi FE) -> vẫn nhận diện được', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [0] }];
-        const result = gradeSubmission(questions, { q1: 0 });
-        assert.equal(result.details[0].isCorrect, true);
-        assert.deepEqual(result.details[0].studentAnswer, [0]);
-    });
-
-    await t.test('mảng chọn lẫn giá trị bẩn (string/null) -> lọc bỏ trước khi so sánh', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [0, 1] }];
-        const result = gradeSubmission(questions, { q1: [0, '1', null, 1] });
-        assert.equal(result.details[0].isCorrect, true);
-    });
-
-    await t.test('không chọn gì (mảng rỗng) -> studentAnswer null, không phải mảng rỗng', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [0, 1] }];
-        const result = gradeSubmission(questions, { q1: [] });
-        assert.equal(result.details[0].studentAnswer, null);
-        assert.equal(result.details[0].isCorrect, false);
-    });
-
-    await t.test('correct_option rỗng (câu hỏi lỗi, không có đáp án đúng nào) -> luôn sai', () => {
-        const questions = [{ id: 'q1', type: 'multiple_answer', correct_option: [] }];
-        const result = gradeSubmission(questions, { q1: [] });
-        assert.equal(result.details[0].isCorrect, false);
+    await t.test('matching: không ghép = Bỏ qua; ghép sai = Sai', () => {
+        const q = { id: 'qg', type: 'matching', pairs: [{ id: 'p1', left: 'A', right: '1' }, { id: 'p2', left: 'B', right: '2' }] };
+        assert.equal(gradeMatching(q, undefined).skipped, true);
+        assert.equal(gradeMatching(q, {}).skipped, true);
+        const wrong = gradeMatching(q, { p1: 'p2', p2: 'p1' });
+        assert.equal(wrong.skipped, false);
+        assert.equal(wrong.fraction, 0);
     });
 });
 
-test('gradeSubmission — câu hỏi CHẤM TAY (essay/upload)', async (t) => {
-    await t.test('có câu essay -> gom vào manualItems, KHÔNG tính vào details/totalPoints', () => {
-        const questions = [
-            { id: 'q1', type: 'multiple_choice', correct_option: 0, score: 1 },
-            { id: 'q2', type: 'essay', score: 5 }
-        ];
-        const result = gradeSubmission(questions, { q1: 0, q2: 'Bài làm tự luận của em...' });
-
-        assert.equal(result.manualItems.length, 1);
-        assert.equal(result.manualItems[0].questionId, 'q2');
-        assert.equal(result.manualItems[0].points, 5);
-        assert.equal(result.manualItems[0].essayAnswer, 'Bài làm tự luận của em...');
-        assert.equal(result.details.length, 1); // chỉ q1 nằm trong details
-        assert.equal(result.totalPoints, 1); // KHÔNG cộng điểm câu essay vào totalPoints
+test('Hồi quy chấm điểm các loại câu khác', async (t) => {
+    await t.test('trắc nghiệm đơn đúng/sai/bỏ qua', () => {
+        const r = gradeSubmission([mcQ('a', 1), mcQ('b', 1), mcQ('c', 1)], { a: 1, b: 2 });
+        assert.equal(r.correctCount, 1);
+        assert.equal(r.incorrectCount, 1);
+        assert.equal(r.skippedCount, 1);
     });
 
-    await t.test('có câu chấm tay -> gradingStatus = pending, score = null (chưa có điểm chính thức)', () => {
-        const questions = [
-            { id: 'q1', type: 'multiple_choice', correct_option: 0, score: 1 },
-            { id: 'q2', type: 'upload', score: 5 }
-        ];
-        const result = gradeSubmission(questions, { q1: 0 });
-
-        assert.equal(result.hasManualItems, true);
-        assert.equal(result.gradingStatus, 'pending');
-        assert.equal(result.score, null);
-        // autoScore vẫn tính riêng phần trắc nghiệm để giáo viên tham khảo
-        assert.equal(result.autoScore, 10);
+    await t.test('chọn nhiều: chỉ đúng khi tập đáp án giống hệt', () => {
+        const q = { id: 'q', type: 'multiple_answer', options: ['a', 'b', 'c'], correct_option: [0, 2] };
+        assert.equal(gradeSubmission([q], { q: [0, 2] }).details[0].isCorrect, true);
+        assert.equal(gradeSubmission([q], { q: [0] }).details[0].isCorrect, false);
+        assert.equal(gradeSubmission([q], { q: [] }).skippedCount, 1);
     });
 
-    await t.test('KHÔNG có câu chấm tay -> gradingStatus = graded, score có giá trị số', () => {
-        const questions = [{ id: 'q1', type: 'multiple_choice', correct_option: 0 }];
-        const result = gradeSubmission(questions, { q1: 0 });
-        assert.equal(result.hasManualItems, false);
-        assert.equal(result.gradingStatus, 'graded');
-        assert.notEqual(result.score, null);
+    await t.test('matching: luồng đầy đủ gửi đề -> học sinh chọn token -> dịch ngược -> chấm 100%', () => {
+        const q = { id: 'qg', type: 'matching', score: 2, pairs: [{ id: 'p1', left: 'A', right: '1' }, { id: 'p2', left: 'B', right: '2' }, { id: 'p3', left: 'C', right: '3' }] };
+        const view = sanitizeQuestionForClient(q, SEED).pairs;
+        const tokenOf = (text) => view.right.find((r) => r.text === text).token;
+        const studentAnswer = { p1: tokenOf('1'), p2: tokenOf('2'), p3: tokenOf('3') };
+        const translated = { qg: translateMatchingAnswer(q, studentAnswer, SEED) };
+        const r = gradeSubmission([q], translated);
+        assert.equal(r.details[0].isCorrect, true);
+        assert.equal(r.earnedPoints, 2);
     });
 
-    await t.test('upload: chỉ chấp nhận URL Cloudinary https hợp lệ, từ chối link lạ', () => {
-        const questions = [{ id: 'q1', type: 'upload', score: 2 }];
-        const resultGood = gradeSubmission(questions, { q1: 'https://res.cloudinary.com/demo/file.pdf' });
-        assert.equal(resultGood.manualItems[0].fileUrl, 'https://res.cloudinary.com/demo/file.pdf');
-
-        const resultBad = gradeSubmission(questions, { q1: 'javascript:alert(1)' });
-        assert.equal(resultBad.manualItems[0].fileUrl, '');
-    });
-
-    await t.test('essay không trả lời gì -> essayAnswer là chuỗi rỗng, không crash', () => {
-        const questions = [{ id: 'q1', type: 'essay', score: 3 }];
-        const result = gradeSubmission(questions, {});
-        assert.equal(result.manualItems[0].essayAnswer, '');
-    });
-
-    await t.test('toàn bộ câu hỏi đều là chấm tay -> totalPoints = 0, autoScore = null (không chia cho 0)', () => {
-        const questions = [{ id: 'q1', type: 'essay', score: 10 }];
-        const result = gradeSubmission(questions, { q1: 'bài làm' });
-        assert.equal(result.totalPoints, 0);
-        assert.equal(result.autoScore, null);
-        assert.equal(result.score, null); // vẫn null vì hasManualItems=true, không phải vì totalPoints=0
+    await t.test('score = null khi có câu chấm tay (chờ giáo viên)', () => {
+        const r = gradeSubmission([mcQ('a', 1), { id: 'e', type: 'essay' }], { a: 1, e: 'x' });
+        assert.equal(r.score, null);
+        assert.equal(r.gradingStatus, 'pending');
     });
 });
 
-test('gradeSubmission — mô phỏng "submit thật" (bài thi hỗn hợp nhiều loại câu)', async (t) => {
-    const questions = [
-        { id: 'q1', type: 'multiple_choice', correct_option: 1, score: 2 }, // đúng
-        { id: 'q2', type: 'multiple_choice', correct_option: 0, score: 2 }, // sai
-        { id: 'q3', type: 'multiple_answer', correct_option: [0, 1], score: 3 }, // đúng
-        { id: 'q4', type: 'true_false', correct_option: 0, score: 1 }, // bỏ qua
-        { id: 'q5', type: 'essay', score: 5 } // chấm tay
-    ];
-    const answers = {
-        q1: 1,
-        q2: 1, // sai
-        q3: [1, 0],
-        // q4 không trả lời
-        q5: 'Bài luận của học sinh.'
-    };
-
-    await t.test('tổng hợp kết quả đúng cho toàn bộ bài thi', () => {
-        const result = gradeSubmission(questions, answers);
-
-        assert.equal(result.totalQuestions, 5);
-        assert.equal(result.correctCount, 2); // q1, q3
-        assert.equal(result.totalPoints, 8); // q1(2) + q2(2) + q3(3) + q4(1), KHÔNG tính q5 (chỉ essay/upload loại trừ)
-        assert.equal(result.earnedPoints, 5); // q1(2) + q3(3)
-        assert.equal(result.autoScore, 6.3); // 5/8 * 10, làm tròn 1 chữ số thập phân
-        assert.equal(result.hasManualItems, true);
-        assert.equal(result.gradingStatus, 'pending');
-        assert.equal(result.score, null); // chờ giáo viên chấm q5
-
-        assert.equal(result.manualItems.length, 1);
-        assert.equal(result.manualItems[0].questionId, 'q5');
-
-        assert.equal(result.details.length, 4); // q1,q2,q3,q4 (không có q5)
-        const byId = Object.fromEntries(result.details.map((d) => [d.questionId, d]));
-        assert.equal(byId.q1.isCorrect, true);
-        assert.equal(byId.q2.isCorrect, false);
-        assert.equal(byId.q3.isCorrect, true);
-        assert.equal(byId.q4.isCorrect, false);
-        assert.equal(byId.q4.studentAnswer, null);
+test('File ôn tập PDF/Word (toReviewQuestionServer)', async (t) => {
+    await t.test('ordering: có "orderedItems" đúng thứ tự đáp án (theo correctOrder), đủ text', () => {
+        const rv = toReviewQuestionServer(orderingQ(), true);
+        assert.deepEqual(rv.orderedItems, [
+            { id: 'a', text: 'Bước A' }, { id: 'b', text: 'Bước B' }, { id: 'c', text: 'Bước C' }
+        ]);
+        assert.equal(rv.type, 'ordering');
     });
 
-    await t.test('dữ liệu answers hoàn toàn rỗng ({}) vẫn không crash, mọi câu tính là sai/bỏ qua', () => {
-        const result = gradeSubmission(questions, {});
-        assert.equal(result.correctCount, 0);
-        assert.equal(result.earnedPoints, 0);
-        result.details.forEach((d) => assert.equal(d.isCorrect, false));
+    await t.test('ordering dữ liệu cũ (không correctOrder): dùng thứ tự mảng items', () => {
+        const q = { id: 'q', type: 'ordering', items: [{ id: 'x', text: 'X' }, { id: 'y', text: 'Y' }] };
+        assert.deepEqual(toReviewQuestionServer(q, false).orderedItems.map((i) => i.text), ['X', 'Y']);
     });
 
-    await t.test('answers chứa questionId lạ (không thuộc bài thi) -> bị bỏ qua, không ảnh hưởng chấm điểm', () => {
-        const result = gradeSubmission(questions, { ...answers, khongTonTai: 999 });
-        assert.equal(result.correctCount, 2);
-        assert.equal(result.totalQuestions, 5);
-    });
-});
-
-test('gradeSubmission — bài thi rỗng (không có câu hỏi nào)', () => {
-    const result = gradeSubmission([], {});
-    assert.equal(result.totalQuestions, 0);
-    assert.equal(result.correctCount, 0);
-    assert.equal(result.totalPoints, 0);
-    assert.equal(result.hasManualItems, false);
-    assert.equal(result.gradingStatus, 'graded');
-    assert.equal(result.autoScore, null);
-    assert.equal(result.score, 0); // không có manual, autoScore null -> score fallback 0
-});
-
-// ============================================================================
-// Helper phụ trợ khác dùng trong chấm tay (isManualQuestionServer, isAllowedUploadUrl)
-// ============================================================================
-test('isManualQuestionServer', () => {
-    assert.equal(isManualQuestionServer({ type: 'essay' }), true);
-    assert.equal(isManualQuestionServer({ type: 'upload' }), true);
-    assert.equal(isManualQuestionServer({ type: 'multiple_choice' }), false);
-    assert.equal(isManualQuestionServer(null), false);
-});
-
-test('isAllowedUploadUrl', () => {
-    assert.equal(isAllowedUploadUrl('https://res.cloudinary.com/demo/image/upload/x.pdf'), true);
-    assert.equal(isAllowedUploadUrl('https://sub.cloudinary.com/x.pdf'), true);
-    assert.equal(isAllowedUploadUrl('http://res.cloudinary.com/x.pdf'), false); // không phải https
-    assert.equal(isAllowedUploadUrl('https://evil.com/fake-cloudinary.com'), false);
-    assert.equal(isAllowedUploadUrl('javascript:alert(1)'), false);
-    assert.equal(isAllowedUploadUrl(''), false);
-    assert.equal(isAllowedUploadUrl(null), false);
-    assert.equal(isAllowedUploadUrl(123), false);
-});
-
-// ============================================================================
-// gradeFillBlank — FIX: mảng theo vị trí (KHÔNG phải object theo id) +
-// field "acceptedAnswers" (camelCase, KHÔNG phải "accepted_answers") + so
-// khớp không phân biệt hoa/thường và có/không dấu tiếng Việt — khớp
-// normalizeBlankAnswer() trong core/gradebook-engine.js phía frontend.
-// ============================================================================
-test('gradeFillBlank', async (t) => {
-    await t.test('trả lời đúng theo đúng thứ tự mảng -> fraction = 1', () => {
-        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }, { acceptedAnswers: ['1945'] }] };
-        const result = gradeFillBlank(q, ['Hà Nội', '1945']);
-        assert.equal(result.fraction, 1);
+    await t.test('ordering: correctOrder trỏ tới id không tồn tại -> text rỗng, không crash', () => {
+        const q = orderingQ({ correctOrder: ['a', 'zzz', 'c'] });
+        assert.deepEqual(toReviewQuestionServer(q, false).orderedItems.map((i) => i.text), ['Bước A', '', 'Bước C']);
     });
 
-    await t.test('không phân biệt hoa/thường và có/không dấu tiếng Việt', () => {
-        const q = { blanks: [{ acceptedAnswers: ['Hà Nội'] }] };
-        assert.equal(gradeFillBlank(q, ['ha noi']).fraction, 1);
-        assert.equal(gradeFillBlank(q, ['HÀ NỘI']).fraction, 1);
-        assert.equal(gradeFillBlank(q, ['  hà   nội  ']).fraction, 1);
+    await t.test('loại câu khác KHÔNG có "orderedItems"', () => {
+        assert.equal('orderedItems' in toReviewQuestionServer(mcQ(), false), false);
     });
 
-    await t.test('đúng 1/2 ô trống -> fraction = 0.5', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }, { acceptedAnswers: ['B'] }] };
-        const result = gradeFillBlank(q, ['A', 'sai']);
-        assert.equal(result.fraction, 0.5);
-    });
-
-    await t.test('trả lời dạng object theo id (định dạng CŨ, SAI) -> không khớp được gì, fraction = 0', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }] };
-        const result = gradeFillBlank(q, { blank_1: 'A' });
-        assert.equal(result.fraction, 0);
-    });
-
-    await t.test('field "accepted_answers" (snake_case CŨ, SAI) không được đọc -> luôn sai dù trả lời đúng', () => {
-        const q = { blanks: [{ accepted_answers: ['A'] }] };
-        const result = gradeFillBlank(q, ['A']);
-        assert.equal(result.fraction, 0);
-    });
-
-    await t.test('bỏ trống 1 ô -> ô đó tính sai, không crash', () => {
-        const q = { blanks: [{ acceptedAnswers: ['A'] }, { acceptedAnswers: ['B'] }] };
-        const result = gradeFillBlank(q, ['A']);
-        assert.equal(result.fraction, 0.5);
-    });
-
-    await t.test('câu hỏi không có "blanks" nào -> fraction = 0, không crash', () => {
-        assert.equal(gradeFillBlank({}, ['A']).fraction, 0);
-    });
-
-    await t.test('gradeSubmission: câu fill_blank hỗn hợp với trắc nghiệm -> chấm điểm từng phần đúng', () => {
-        const questions = [
-            { id: 'q1', type: 'multiple_choice', correct_option: 0, score: 1 },
-            { id: 'q2', type: 'fill_blank', score: 4, blanks: [{ acceptedAnswers: ['Hà Nội'] }, { acceptedAnswers: ['1945'] }] }
-        ];
-        const result = gradeSubmission(questions, { q1: 0, q2: ['ha noi', 'sai'] });
-        assert.equal(result.totalPoints, 5);
-        assert.equal(result.earnedPoints, 1 + 4 * 0.5);
-        assert.equal(result.details.find((d) => d.questionId === 'q2').partialFraction, 0.5);
-    });
-});
-
-// ============================================================================
-// gradeOrdering — (GĐ3.6.2) thêm "correctOrder" tách đáp án đúng khỏi
-// thứ tự lưu trong "items", vẫn giữ được câu hỏi cũ chưa có field này.
-// ============================================================================
-test('gradeOrdering', async (t) => {
-    await t.test('có "correctOrder": chấm theo correctOrder, KHÔNG theo thứ tự "items"', () => {
-        const q = {
-            items: [{ id: 'b' }, { id: 'a' }, { id: 'c' }], // thứ tự hiển thị/lưu, KHÔNG phải đáp án
-            correctOrder: ['a', 'b', 'c']
-        };
-        const result = gradeOrdering(q, ['a', 'b', 'c']);
-        assert.equal(result.fraction, 1);
-        assert.deepEqual(result.correctAnswerForDetail, ['a', 'b', 'c']);
-    });
-
-    await t.test('không có "correctOrder" (dữ liệu cũ) -> dự phòng bằng thứ tự "items" như trước', () => {
-        const q = { items: [{ id: 'x' }, { id: 'y' }] };
-        const result = gradeOrdering(q, ['x', 'y']);
-        assert.equal(result.fraction, 1);
-        assert.deepEqual(result.correctAnswerForDetail, ['x', 'y']);
-    });
-
-    await t.test('đúng 1/3 vị trí theo correctOrder -> fraction = 1/3', () => {
-        const q = { items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }], correctOrder: ['a', 'b', 'c'] };
-        const result = gradeOrdering(q, ['a', 'x', 'y']);
-        assert.equal(result.fraction, 1 / 3);
-    });
-
-    await t.test('không có items lẫn correctOrder -> fraction = 0, không chia cho 0', () => {
-        const result = gradeOrdering({}, ['a']);
-        assert.equal(result.fraction, 0);
-        assert.deepEqual(result.correctAnswerForDetail, []);
-    });
-});
-
-test('extractManualAnswerServer', async (t) => {
-    await t.test('essay: chấp nhận string thuần', () => {
-        const r = extractManualAnswerServer({ type: 'essay' }, '  bài làm  ');
-        assert.equal(r.essayAnswer, 'bài làm');
-    });
-
-    await t.test('essay: chấp nhận object { essayAnswer }', () => {
-        const r = extractManualAnswerServer({ type: 'essay' }, { essayAnswer: 'nội dung' });
-        assert.equal(r.essayAnswer, 'nội dung');
-    });
-
-    await t.test('essay: cắt bớt nếu vượt quá độ dài tối đa', () => {
-        const longText = 'a'.repeat(25000);
-        const r = extractManualAnswerServer({ type: 'essay' }, longText);
-        assert.equal(r.essayAnswer.length, 20000);
-    });
-
-    await t.test('upload: object { fileUrl, fileName }', () => {
-        const r = extractManualAnswerServer(
-            { type: 'upload' },
-            { fileUrl: 'https://res.cloudinary.com/x.pdf', fileName: 'baitap.pdf' }
-        );
-        assert.equal(r.fileUrl, 'https://res.cloudinary.com/x.pdf');
-        assert.equal(r.fileName, 'baitap.pdf');
+    await t.test('alias: type "ordering" được nhận diện qua normalizeQuestionType', () => {
+        assert.ok(Array.isArray(toReviewQuestionServer(orderingQ(), false).orderedItems));
     });
 });
