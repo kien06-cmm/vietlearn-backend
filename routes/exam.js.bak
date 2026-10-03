@@ -2,7 +2,6 @@
 
 const express = require('express');
 const { seededShuffle, sanitizeQuestionForClient } = require('../lib/grading');
-const { normalizeExamType } = require('../helpers/exam-type');
 
 function createExamRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
     const {
@@ -37,30 +36,6 @@ function createExamRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
                 if (usedAttempts >= maxAttempts) {
                     return res.status(403).json({ message: 'Bạn đã hết số lần làm bài cho phép đối với bài kiểm tra này.' });
                 }
-            }
-
-            // Bài Tự luận / Nộp file cả bài không có câu hỏi nào: chỉ có đề bài (prompt).
-            // Vẫn phải mở phiên làm bài để /api/submit-exam kiểm tra thời gian.
-            const examType = normalizeExamType(examData.type);
-            if (examType !== 'quiz') {
-                const prompt = typeof examData.prompt === 'string' ? examData.prompt : '';
-                if (!prompt.trim()) {
-                    return res.status(400).json({ message: 'Bài kiểm tra chưa có yêu cầu đề bài. Vui lòng liên hệ giáo viên.' });
-                }
-
-                const startedAtMs = await getOrStartExamSession(examId, studentId, examData);
-                return res.json({
-                    examId,
-                    title: examData.quizName || examData.title || '',
-                    type: examType,
-                    prompt,
-                    duration: examData.duration || 15,
-                    unlimitedTime: examData.unlimitedTime === true,
-                    allowSkip: true,
-                    allowFlagForReview: false,
-                    startedAt: startedAtMs,
-                    questions: []
-                });
             }
 
             const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];

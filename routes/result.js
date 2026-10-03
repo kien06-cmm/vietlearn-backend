@@ -5,8 +5,35 @@ const {
     getOptionTextsServer,
     toReviewQuestionServer,
     buildOrderingResultView,
-    buildDragDropResultView
+    buildDragDropResultView,
+    normalizeQuestionType
 } = require('../lib/grading');
+
+/**
+ * Câu trả lời "chưa làm": null/undefined, chuỗi trắng, mảng rỗng hoặc toàn phần tử trắng.
+ * Số 0 là đáp án hợp lệ (đáp án A có chỉ số 0). Object (ghép đôi / kéo-thả) do cờ d.skipped quyết định, không xét ở đây.
+ */
+function isBlankAnswer(value) {
+    if (value === null || value === undefined) return true;
+    if (typeof value === 'string') return value.trim() === '';
+    if (Array.isArray(value)) return value.every(isBlankAnswer);
+    return false;
+}
+
+/**
+ * Loại câu của 1 phần tử details. Ưu tiên type của câu hỏi (đã giải alias, vd multi_select -> multiple_answer).
+ * Câu hỏi đã bị xoá khỏi ngân hàng (q = {}) thì suy ra từ dữ liệu đã lưu trong details, để màn Xem lại
+ * vẫn dựng đúng thẻ thay vì rơi về trắc nghiệm rỗng.
+ */
+function resolveDetailType(q, d) {
+    if (typeof q.type === 'string' && q.type) return normalizeQuestionType(q.type);
+    if (d && d.dragTexts && typeof d.dragTexts === 'object') return 'drag_drop';
+    if (d && d.itemTexts && typeof d.itemTexts === 'object') return 'ordering';
+    const correct = Array.isArray(d && d.correctAnswer) ? d.correctAnswer : [];
+    if (correct.length > 0 && correct.every((b) => b && typeof b === 'object' && Array.isArray(b.acceptedAnswers))) return 'fill_blank';
+    if (correct.length > 0 && correct.every((p) => p && typeof p === 'object' && 'left' in p && 'right' in p)) return 'matching';
+    return 'multiple_choice';
+}
 
 function createResultRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
     const { fetchQuestionsByIds, checkReviewDownloadAccess } = examHelpers;
@@ -41,7 +68,7 @@ function createResultRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
             const totalQuestions = Number(resultData.totalQuestions) || fullDetails.length;
             const correctCount = Number(resultData.correctCount) || 0;
             const skippedCount = fullDetails.filter(
-                (d) => d.skipped === true || d.studentAnswer === null || d.studentAnswer === undefined
+                (d) => d.skipped === true || isBlankAnswer(d.studentAnswer)
             ).length;
             const manualCount = Array.isArray(resultData.manualItems) ? resultData.manualItems.length : 0;
             const incorrectCount = Math.max(0, totalQuestions - manualCount - correctCount - skippedCount);
@@ -58,7 +85,9 @@ function createResultRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
                 scoreVisible,
                 questionsVisible,
                 explanationVisible,
-                gradingStatus: resultData.gradingStatus || 'graded'
+                gradingStatus: resultData.gradingStatus || 'graded',
+                // Cờ miễn thi thật do giáo viên đặt (routes/grading.js); client không được tự suy ra từ score === null.
+                excused: resultData.excused === true || resultData.status === 'excused'
             };
 
             if (Array.isArray(resultData.manualItems) && resultData.manualItems.length > 0) {
@@ -90,7 +119,7 @@ function createResultRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
 
                 responsePayload.questions = fullDetails.map((d) => {
                     const q = questionMap[d.questionId] || {};
-                    const canonicalType = typeof q.type === 'string' ? q.type : 'multiple_choice';
+                    const canonicalType = resolveDetailType(q, d);
                     const item = {
                         id: d.questionId,
                         type: canonicalType,
@@ -130,7 +159,12 @@ function createResultRouter({ dbAdmin, verifyFirebaseToken, examHelpers }) {
 
                     if (canonicalType === 'ordering' && Array.isArray(d.correctAnswer)) {
                         const orderingView = buildOrderingResultView(q, d);
-                        item.items = orderingView.items;
+                        // Ảnh chụp chữ lúc chấm (d.itemTexts) ưu tiên hơn câu hỏi hiện tại: giáo viên sửa/xoá câu về sau
+                        // không được làm lệch bài đã nộp (cùng cách với d.dragTexts của câu Kéo-thả).
+                        const snapTexts = (d.itemTexts && typeof d.itemTexts === 'object') ? d.itemTexts : {};
+                        item.items = d.correctAnswer.map((id, i) => (
+                            typeof snapTexts[id] === 'string' ? snapTexts[id] : orderingView.items[i]
+                        ));
                         item.studentPositions = orderingView.studentPositions;
                     }
 

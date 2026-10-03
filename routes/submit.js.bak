@@ -4,53 +4,8 @@ const express = require('express');
 const {
     gradeSubmission,
     normalizeQuestionType,
-    translateMatchingAnswer,
-    isAllowedUploadUrl,
-    MAX_ESSAY_LENGTH
+    translateMatchingAnswer
 } = require('../lib/grading');
-const { normalizeExamType } = require('../helpers/exam-type');
-
-const MAX_FILE_NAME_LENGTH = 200;
-
-/** Nếu server đặt biến môi trường CLOUDINARY_CLOUD_NAME thì link file phải thuộc đúng tài khoản đó (giống kiểm tra ở frontend). */
-function isConfiguredCloudUrl(url) {
-    const cloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
-    if (!cloudName) return true;
-    try {
-        return new URL(url).pathname.startsWith(`/${cloudName}/`);
-    } catch (err) {
-        return false;
-    }
-}
-
-/**
- * Bài Tự luận / Nộp file CẢ BÀI: không có câu hỏi nào để chấm tự động, bài làm nằm ở body.essayAnswer / body.fileUrl.
- * Trả về { ok: true, item } với item đúng dạng manualItems mà trang quản lý kết quả đọc, hoặc { ok: false, message }.
- */
-function buildWholeExamManualItem(examType, examData, body) {
-    const questionText = typeof examData.prompt === 'string' ? examData.prompt.trim() : '';
-
-    if (examType === 'essay') {
-        const essayAnswer = typeof body.essayAnswer === 'string' ? body.essayAnswer.trim() : '';
-        if (!essayAnswer) {
-            return { ok: false, message: 'Bài tự luận chưa có nội dung. Vui lòng nhập bài làm trước khi nộp.' };
-        }
-        if (essayAnswer.length > MAX_ESSAY_LENGTH) {
-            return {
-                ok: false,
-                message: `Bài tự luận quá dài (tối đa ${MAX_ESSAY_LENGTH} ký tự). Vui lòng rút gọn rồi nộp lại.`
-            };
-        }
-        return { ok: true, item: { questionId: '', type: 'essay', questionText, essayAnswer } };
-    }
-
-    const fileUrl = typeof body.fileUrl === 'string' ? body.fileUrl.trim() : '';
-    if (!isAllowedUploadUrl(fileUrl) || !isConfiguredCloudUrl(fileUrl)) {
-        return { ok: false, message: 'Link file bài nộp không hợp lệ. Vui lòng tải file lên lại rồi nộp bài.' };
-    }
-    const fileName = typeof body.fileName === 'string' ? body.fileName.trim().slice(0, MAX_FILE_NAME_LENGTH) : '';
-    return { ok: true, item: { questionId: '', type: 'upload', questionText, fileUrl, fileName } };
-}
 
 function createSubmitRouter({ dbAdmin, FieldValue, verifyFirebaseToken, examHelpers }) {
     const {
@@ -85,22 +40,9 @@ function createSubmitRouter({ dbAdmin, FieldValue, verifyFirebaseToken, examHelp
             }
             const examData = access.examData;
 
-            // Hình thức bài lấy từ DB, không tin client.
-            const examType = normalizeExamType(examData.type);
-            const isQuizExam = examType === 'quiz';
-
-            let wholeExamItem = null;
-            if (isQuizExam) {
-                const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
-                if (questionIds.length === 0) {
-                    return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
-                }
-            } else {
-                const built = buildWholeExamManualItem(examType, examData, req.body);
-                if (!built.ok) {
-                    return res.status(400).json({ message: built.message });
-                }
-                wholeExamItem = built.item;
+            const questionIds = Array.isArray(examData.questionIds) ? examData.questionIds : [];
+            if (questionIds.length === 0) {
+                return res.status(400).json({ message: 'Bài kiểm tra chưa có câu hỏi.' });
             }
 
             const sessionSnap = await dbAdmin.collection('exam_sessions').doc(`${exam_id}_${studentId}`).get();
@@ -122,35 +64,16 @@ function createSubmitRouter({ dbAdmin, FieldValue, verifyFirebaseToken, examHelp
                 console.warn(`Nộp bài trễ hơn dung sai cho phép: exam=${exam_id}, student=${studentId}, serverElapsedSeconds=${serverElapsedSeconds}, allowedDurationSeconds=${allowedDurationSeconds}`);
             }
 
-            let grading;
-            if (isQuizExam) {
-                const questions = await fetchQuestionsByIds(examData.questionIds);
+            const questions = await fetchQuestionsByIds(questionIds);
 
-                const translatedAnswers = { ...safeAnswers };
-                questions.forEach((q) => {
-                    if (normalizeQuestionType(q.type) === 'matching') {
-                        translatedAnswers[q.id] = translateMatchingAnswer(
-                            q, safeAnswers[q.id], `${exam_id}_${studentId}_${q.id}`
-                        );
-                    }
-                });
-
-                grading = gradeSubmission(questions, translatedAnswers);
-            } else {
-                // Không có câu nào để tự chấm: toàn bộ bài chờ giáo viên chấm, chưa có điểm.
-                grading = {
-                    correctCount: 0,
-                    skippedCount: 0,
-                    incorrectCount: 0,
-                    details: [],
-                    manualItems: [wholeExamItem],
-                    totalQuestions: 0,
-                    hasManualItems: true,
-                    gradingStatus: 'pending',
-                    autoScore: null,
-                    score: null
-                };
-            }
+            const translatedAnswers = { ...safeAnswers };
+            questions.forEach((q) => {
+                if (normalizeQuestionType(q.type) === 'matching') {
+                    translatedAnswers[q.id] = translateMatchingAnswer(
+                        q, safeAnswers[q.id], `${exam_id}_${studentId}_${q.id}`
+                    );
+                }
+            });
 
             const {
                 correctCount,
@@ -163,7 +86,7 @@ function createSubmitRouter({ dbAdmin, FieldValue, verifyFirebaseToken, examHelp
                 gradingStatus,
                 autoScore,
                 score
-            } = grading;
+            } = gradeSubmission(questions, translatedAnswers);
 
             let studentName = 'Học sinh';
             try {
